@@ -221,3 +221,6 @@ data/
 # python environment files
 *.env
 emg_env
+
+#mlflow files
+mlruns/
