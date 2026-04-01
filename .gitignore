@@ -223,4 +223,11 @@ data/
 emg_env
 
 #mlflow files
-mlruns/
+mlruns
+
+# other
+literature
+
+# config files
+config.yaml
+config.json
