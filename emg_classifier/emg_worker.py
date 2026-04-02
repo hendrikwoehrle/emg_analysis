@@ -164,39 +164,72 @@ class MultiScaleBlock(nn.Module):
         return self.proj(torch.cat([b(x) for b in self.branches], dim=1))
 
 
-class ConventionalCNN(nn.Module):
-    """Conventional CNN baseline from Emimal et al. 2025.
+def _coarse_grain(x: torch.Tensor, scale: int) -> torch.Tensor:
+    """Average non-overlapping windows of size `scale` along the time axis.
 
-    Architecture (raw EMG signal, no attention):
-        Conv1d(n_channels → 32, kernel=32) → ReLU
-        MaxPool1d(5)
-        Flatten
-        Linear(32 * (window_size // 5) → 512) → ReLU
+    Implements Eq. (1) from Emimal et al. 2025:
+        c^(s)_j = (1/s) * sum_{i=(j-1)*s+1}^{j*s} x_i,  1 <= j <= N/s
+
+    Args:
+        x:     (B, C, L)
+        scale: averaging window size s; scale=1 returns x unchanged.
+
+    Returns:
+        (B, C, L // scale)
+    """
+    if scale == 1:
+        return x
+    B, C, L = x.shape
+    L_new = L // scale
+    return x[:, :, : L_new * scale].reshape(B, C, L_new, scale).mean(dim=-1)
+
+
+class ConventionalCNN(nn.Module):
+    """Multi-scale coarse-grained CNN from Emimal et al. 2025 (3 scales, no attention).
+
+    Implements the "3 Scales + no attention" ablation from Table 2 / Fig. 1.
+
+    Pipeline:
+        For each scale s in {1, 2, 3}:
+            coarse-grain x → c^(s)  shape (B, C, W//s)          [Eq. 1]
+            Conv1d(C → 32, kernel=7, same-pad) → ReLU
+            MaxPool1d(5)                                          [Eq. 4-5]
+            GlobalAveragePool → r^(s)  shape (B, 32)             [Eq. 6]
+        Concatenate [r^(1), r^(2), r^(3)] → shape (B, 96)       [Eq. 7]
+        Linear(96 → 512) → ReLU
         Linear(512 → num_classes)
 
-    Reference: Table 1 / Fig. 2 in Emimal et al. 2025.
+    Reference: Emimal et al. 2025, Sec. 2.3–2.4, Fig. 1, Table 2.
     """
 
-    def __init__(self, n_channels: int, num_classes: int, window_size: int):
+    SCALES = (1, 2, 3)
+
+    def __init__(self, n_channels: int, num_classes: int):
         super().__init__()
-        # After Conv1d with same padding the time dimension stays == window_size,
-        # then MaxPool1d(5) reduces it to window_size // 5.
-        pooled_len = window_size // 5
-        self.conv = nn.Sequential(
-            nn.Conv1d(n_channels, 32, kernel_size=32, padding=32 // 2, bias=True),
+        # One shared Conv+Pool branch applied independently to each scale.
+        # Using the same weights across scales is consistent with the paper
+        # ("a uniform filter size has been applied across all coarse-grained signals").
+        self.branch = nn.Sequential(
+            nn.Conv1d(n_channels, 32, kernel_size=7, padding=3, bias=True),
             nn.ReLU(inplace=True),
             nn.MaxPool1d(kernel_size=5, stride=5),
         )
+        self.gap = nn.AdaptiveAvgPool1d(1)   # global average pool → (B, 32, 1)
         self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(32 * pooled_len, 512),
+            nn.Linear(32 * len(self.SCALES), 512),
             nn.ReLU(inplace=True),
             nn.Linear(512, num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, W)
-        return self.classifier(self.conv(x))
+        scale_feats = []
+        for s in self.SCALES:
+            c_s = _coarse_grain(x, s)                   # (B, C, W//s)
+            r_s = self.gap(self.branch(c_s)).squeeze(-1) # (B, 32)
+            scale_feats.append(r_s)
+        r = torch.cat(scale_feats, dim=1)               # (B, 96)
+        return self.classifier(r)
 
 
 class MultiScaleEMGNet(nn.Module):
@@ -333,7 +366,7 @@ def train_and_evaluate(
 
         n_channels = train_ds[0][0].shape[0]
         if model_type == "conventional":
-            model = ConventionalCNN(n_channels, num_classes, window_size).to(device)
+            model = ConventionalCNN(n_channels, num_classes).to(device)
         else:
             model = MultiScaleEMGNet(
                 n_channels, num_classes, kernels=kernels, num_stages=num_stages

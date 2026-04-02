@@ -62,7 +62,6 @@ from torch.utils.data import DataLoader
 
 from emg_worker import (
     ConvBnRelu,
-    MultiScaleEMGNet,
     NinaProDatasetByRepetition,
     load_subject,
     run_task,
@@ -127,7 +126,7 @@ def detect_gpus() -> list[str]:
         )
         if r.returncode == 0:
             names = [l for l in r.stdout.strip().splitlines() if l.strip()]
-            names = [0, 1, 2]
+            names = [3,4,5,6]
             if names:
                 return [f"cuda:{i}" for i in range(len(names))]
     except Exception:
@@ -159,11 +158,51 @@ def get_finished_runs(mlruns_dir: str, experiment: str) -> set[str]:
 # Train mode
 # ===========================================================================
 
-def run_name_for(db, subject, window_size, kernels, num_stages) -> str:
+def run_name_for(db, subject, window_size, kernels, num_stages,
+                 model_type: str = "multiscale") -> str:
+    if model_type == "conventional":
+        return f"db{db}_s{subject}_w{window_size}_conventional"
     return f"db{db}_s{subject}_w{window_size}_k{'_'.join(map(str, kernels))}_stages{num_stages}"
 
 
-def cmd_train(cfg: dict) -> None:
+def _build_pending(cfg: dict, model_type: str, finished: set) -> list:
+    """Return list of (subject, kernels, window_size, num_stages, model_type) tuples."""
+    pending = []
+    db = cfg["db"]
+
+    if model_type in ("multiscale", "both"):
+        combos = list(itertools.product(cfg["conv_config"],
+                                        cfg["window_sizes"],
+                                        cfg["num_stages"]))
+        for subject in cfg["subjects"]:
+            for kernels, window_size, num_stages in combos:
+                if run_name_for(db, subject, window_size, kernels, num_stages,
+                                "multiscale") not in finished:
+                    pending.append((subject, kernels, window_size, num_stages, "multiscale"))
+
+    if model_type in ("conventional", "both"):
+        for subject in cfg["subjects"]:
+            for window_size in cfg["window_sizes"]:
+                if run_name_for(db, subject, window_size, None, None,
+                                "conventional") not in finished:
+                    # kernels/num_stages unused for conventional; pass placeholders
+                    pending.append((subject, (3, 5, 11), window_size, 1, "conventional"))
+
+    return pending
+
+
+def _total_runs(cfg: dict, model_type: str) -> int:
+    n_ms = (len(cfg["subjects"]) * len(cfg["conv_config"])
+            * len(cfg["window_sizes"]) * len(cfg["num_stages"]))
+    n_cv = len(cfg["subjects"]) * len(cfg["window_sizes"])
+    if model_type == "multiscale":
+        return n_ms
+    if model_type == "conventional":
+        return n_cv
+    return n_ms + n_cv   # "both"
+
+
+def cmd_train(cfg: dict, model_type: str) -> None:
     devices = detect_gpus()
     n_workers = len(devices)
     print(f"Available devices : {devices}")
@@ -171,19 +210,10 @@ def cmd_train(cfg: dict) -> None:
     mlflow.set_tracking_uri(cfg["mlruns_dir"])
     mlflow.set_experiment(cfg["experiment"])
 
-    combos = list(itertools.product(cfg["conv_config"],
-                                    cfg["window_sizes"],
-                                    cfg["num_stages"]))
     finished = get_finished_runs(cfg["mlruns_dir"], cfg["experiment"])
+    pending  = _build_pending(cfg, model_type, finished)
+    total    = _total_runs(cfg, model_type)
 
-    pending = [
-        (subject, kernels, window_size, num_stages)
-        for subject in cfg["subjects"]
-        for kernels, window_size, num_stages in combos
-        if run_name_for(cfg["db"], subject, window_size, kernels, num_stages)
-           not in finished
-    ]
-    total = len(cfg["subjects"]) * len(combos)
     print(f"Total runs        : {total}")
     print(f"Already done      : {total - len(pending)}  (skipped)")
     print(f"Remaining         : {len(pending)}  across {n_workers} worker(s)")
@@ -195,22 +225,22 @@ def cmd_train(cfg: dict) -> None:
     # Build full task tuples (device assigned round-robin)
     tasks = [
         (
-            cfg["db"], subject, kernels, window_size, num_stages,
+            cfg["db"], p[0], p[1], p[2], p[3],
             devices[idx % n_workers],
             str(cfg["ninapro_dir"]),
             cfg["train_reps"], cfg["test_reps"], cfg["window_step"],
             cfg["epochs"], cfg["lr"], cfg["weight_decay"], cfg["batch_size"],
-            cfg["fs"], cfg["mlruns_dir"], cfg["experiment"],
+            cfg["fs"], cfg["mlruns_dir"], cfg["experiment"], p[4],
         )
-        for idx, (subject, kernels, window_size, num_stages) in enumerate(pending)
+        for idx, p in enumerate(pending)
     ]
 
     if n_workers == 1:
-        # Single device – run in-process, no forking needed.
         for i, t in enumerate(tasks, 1):
-            subject, kernels, window_size, num_stages = t[1], t[2], t[3], t[4]
-            print(f"[{i}/{len(tasks)}] subject={subject}  kernels={kernels}  "
-                  f"window={window_size}  stages={num_stages}  device={t[5]}")
+            subject, kernels, window_size, num_stages, mtype = t[1], t[2], t[3], t[4], t[17]
+            extra = f"  kernels={kernels}  stages={num_stages}" if mtype == "multiscale" else ""
+            print(f"[{i}/{len(tasks)}] subject={subject}  model={mtype}  "
+                  f"window={window_size}{extra}  device={t[5]}")
             r = run_task(t)
             print(f"  → acc={r['final_acc']:.4f}")
     else:
@@ -223,7 +253,8 @@ def cmd_train(cfg: dict) -> None:
                 try:
                     r = fut.result()
                     print(f"[{i}/{len(tasks)}] done  "
-                          f"subject={r['subject']}  acc={r['final_acc']:.4f}")
+                          f"subject={r['subject']}  model={r['model_type']}  "
+                          f"acc={r['final_acc']:.4f}")
                 except Exception as e:
                     print(f"[{i}/{len(tasks)}] ERROR  task={t[:5]}  {e}")
 
@@ -257,24 +288,26 @@ def cmd_results(cfg: dict, plot: bool = False, save_plot: str | None = None) -> 
     records = []
     for r in all_runs:
         p = r.data.params
+        mtype = p.get("model_type", "multiscale")
         records.append({
+            "model_type":  mtype,
             "subject":     int(p.get("subject", -1)),
-            "kernels":     p.get("kernels", ""),
+            "kernels":     p.get("kernels", "") if mtype == "multiscale" else "—",
             "window_size": int(p.get("window_size", -1)),
-            "num_stages":  int(p.get("num_stages", -1)),
+            "num_stages":  int(p.get("num_stages", -1)) if mtype == "multiscale" else 0,
             "final_acc":   r.data.metrics.get("final_test_acc", float("nan")),
             "n_params":    int(p.get("n_params", 0)),
             "run_name":    r.info.run_name,
         })
 
     df = pd.DataFrame(records).sort_values(
-        ["subject", "kernels", "window_size", "num_stages"]
+        ["model_type", "subject", "kernels", "window_size", "num_stages"]
     )
     print(f"Loaded {len(df)} finished runs\n")
     print(df.to_string(index=False))
 
     pivot = (
-        df.groupby(["kernels", "window_size", "num_stages"])["final_acc"]
+        df.groupby(["model_type", "kernels", "window_size", "num_stages"])["final_acc"]
         .agg(["mean", "std", "count"])
         .reset_index()
         .sort_values("mean", ascending=False)
@@ -284,14 +317,17 @@ def cmd_results(cfg: dict, plot: bool = False, save_plot: str | None = None) -> 
 
     if plot or save_plot:
         import matplotlib.pyplot as plt
-        fig, ax = plt.subplots(figsize=(14, 5))
+        _, ax = plt.subplots(figsize=(14, 5))
         labels_bar = [
-            f"k={r['kernels']}\nw={r['window_size']} s={r['num_stages']}"
+            (f"{r['model_type']}\nk={r['kernels']} s={r['num_stages']}"
+             if r["model_type"] == "multiscale"
+             else f"conventional\nw={r['window_size']}")
+            + f"\nw={r['window_size']}"
             for _, r in pivot.iterrows()
         ]
         ax.bar(range(len(pivot)), pivot["mean"], yerr=pivot["std"], capsize=4)
         ax.set_xticks(range(len(pivot)))
-        ax.set_xticklabels(labels_bar, fontsize=8)
+        ax.set_xticklabels(labels_bar, fontsize=7)
         ax.set_ylabel("Mean Test Accuracy")
         ax.set_title("Hyperparameter comparison (mean ± std over subjects)")
         plt.tight_layout()
@@ -308,8 +344,7 @@ def cmd_results(cfg: dict, plot: bool = False, save_plot: str | None = None) -> 
 # Quantize mode
 # ===========================================================================
 
-def _build_datasets(cfg: dict, subject: int, window_size: int,
-                    kernels: tuple, num_stages: int):
+def _build_datasets(cfg: dict, subject: int, window_size: int):
     tmp = load_subject(cfg["db"], subject, cfg["ninapro_dir"])
     tmp_labels = tmp["restimulus"] if tmp["restimulus"].size else tmp["stimulus"]
     tmp_reps = tmp["repetition"].astype(int)
@@ -344,8 +379,9 @@ def _evaluate_cpu(model: nn.Module, loader: DataLoader) -> float:
 
 
 def _load_fp32_model(cfg: dict, subject: int, window_size: int,
-                     kernels: tuple, num_stages: int) -> nn.Module:
-    name = run_name_for(cfg["db"], subject, window_size, kernels, num_stages)
+                     kernels: tuple, num_stages: int,
+                     model_type: str = "multiscale") -> nn.Module:
+    name = run_name_for(cfg["db"], subject, window_size, kernels, num_stages, model_type)
     mlflow.set_tracking_uri(cfg["mlruns_dir"])
     client = mlflow.tracking.MlflowClient()
     exp = client.get_experiment_by_name(cfg["experiment"])
@@ -386,7 +422,7 @@ def _throughput_ms(model: nn.Module, loader: DataLoader, n_batches: int = 20) ->
 
 def quantize_ptq(fp32_model: nn.Module, calib_loader: DataLoader,
                  n_calib_batches: int) -> nn.Module:
-    import torch.quantization as tq
+    import torch.ao.quantization as tq
     model = copy.deepcopy(fp32_model).cpu().eval()
     for _, module in model.named_modules():
         if isinstance(module, ConvBnRelu):
@@ -404,7 +440,7 @@ def quantize_ptq(fp32_model: nn.Module, calib_loader: DataLoader,
 
 def quantize_qat(fp32_model: nn.Module, train_loader: DataLoader,
                  test_loader: DataLoader, epochs: int, lr: float) -> nn.Module:
-    import torch.quantization as tq
+    import torch.ao.quantization as tq
     model = copy.deepcopy(fp32_model).cpu().train()
     for _, module in model.named_modules():
         if isinstance(module, ConvBnRelu):
@@ -442,13 +478,14 @@ def quantize_qat(fp32_model: nn.Module, train_loader: DataLoader,
 
 def cmd_quantize(cfg: dict, subject: int, kernels: tuple, window_size: int,
                  num_stages: int, method: str, qat_epochs: int, qat_lr: float,
-                 ptq_calib_batches: int) -> None:
-    print(f"Loading FP32 model for subject={subject}, kernels={kernels}, "
-          f"window={window_size}, stages={num_stages} …")
-    fp32_model = _load_fp32_model(cfg, subject, window_size, kernels, num_stages)
+                 ptq_calib_batches: int, model_type: str = "multiscale") -> None:
+    print(f"Loading FP32 model for subject={subject}, model={model_type}, "
+          f"window={window_size}" +
+          (f", kernels={kernels}, stages={num_stages}" if model_type == "multiscale" else "") +
+          " …")
+    fp32_model = _load_fp32_model(cfg, subject, window_size, kernels, num_stages, model_type)
 
-    train_ds, test_ds, _ = _build_datasets(cfg, subject, window_size,
-                                            kernels, num_stages)
+    train_ds, test_ds, _ = _build_datasets(cfg, subject, window_size)
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"],
                               shuffle=True,  num_workers=0)
     test_loader  = DataLoader(test_ds,  batch_size=cfg["batch_size"],
@@ -556,7 +593,10 @@ def make_parser() -> argparse.ArgumentParser:
     sub.required = True
 
     # ── train ──────────────────────────────────────────────────────────────
-    sub.add_parser("train", help="Run / resume the grid search.")
+    tp = sub.add_parser("train", help="Run / resume the grid search.")
+    tp.add_argument("--model", choices=["multiscale", "conventional", "both"],
+                    default="both",
+                    help="Which model(s) to train (default: both)")
 
     # ── results ────────────────────────────────────────────────────────────
     rp = sub.add_parser("results", help="Print ranked results from MLflow.")
@@ -579,6 +619,9 @@ def make_parser() -> argparse.ArgumentParser:
     qp.add_argument("--qat-lr",     dest="qat_lr",     type=float, default=1e-4)
     qp.add_argument("--ptq-calib-batches", dest="ptq_calib_batches",
                     type=int, default=32)
+    qp.add_argument("--model", choices=["multiscale", "conventional"],
+                    default="multiscale",
+                    help="Which model to quantize (default: multiscale)")
 
     return p
 
@@ -600,7 +643,7 @@ def main() -> None:
     print()
 
     if args.command == "train":
-        cmd_train(cfg)
+        cmd_train(cfg, model_type=args.model)
 
     elif args.command == "results":
         cmd_results(cfg, plot=args.plot, save_plot=args.save_plot)
@@ -616,6 +659,7 @@ def main() -> None:
             qat_epochs=args.qat_epochs,
             qat_lr=args.qat_lr,
             ptq_calib_batches=args.ptq_calib_batches,
+            model_type=args.model,
         )
 
 
