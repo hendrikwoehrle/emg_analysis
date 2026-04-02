@@ -164,6 +164,41 @@ class MultiScaleBlock(nn.Module):
         return self.proj(torch.cat([b(x) for b in self.branches], dim=1))
 
 
+class ConventionalCNN(nn.Module):
+    """Conventional CNN baseline from Emimal et al. 2025.
+
+    Architecture (raw EMG signal, no attention):
+        Conv1d(n_channels → 32, kernel=32) → ReLU
+        MaxPool1d(5)
+        Flatten
+        Linear(32 * (window_size // 5) → 512) → ReLU
+        Linear(512 → num_classes)
+
+    Reference: Table 1 / Fig. 2 in Emimal et al. 2025.
+    """
+
+    def __init__(self, n_channels: int, num_classes: int, window_size: int):
+        super().__init__()
+        # After Conv1d with same padding the time dimension stays == window_size,
+        # then MaxPool1d(5) reduces it to window_size // 5.
+        pooled_len = window_size // 5
+        self.conv = nn.Sequential(
+            nn.Conv1d(n_channels, 32, kernel_size=32, padding=32 // 2, bias=True),
+            nn.ReLU(inplace=True),
+            nn.MaxPool1d(kernel_size=5, stride=5),
+        )
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(32 * pooled_len, 512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, W)
+        return self.classifier(self.conv(x))
+
+
 class MultiScaleEMGNet(nn.Module):
     def __init__(
         self,
@@ -232,17 +267,29 @@ def train_and_evaluate(
     fs: int,
     mlruns_dir: str,
     experiment: str,
+    model_type: str = "multiscale",
 ) -> dict:
-    run_name = (
-        f"db{db}_s{subject}_w{window_size}"
-        f"_k{'_'.join(map(str, kernels))}_stages{num_stages}"
-    )
+    """Train and evaluate one subject.
+
+    Args:
+        model_type: ``"multiscale"`` for MultiScaleEMGNet (default) or
+                    ``"conventional"`` for the ConventionalCNN baseline
+                    from Emimal et al. 2025.
+    """
+    if model_type == "conventional":
+        run_name = f"db{db}_s{subject}_w{window_size}_conventional"
+    else:
+        run_name = (
+            f"db{db}_s{subject}_w{window_size}"
+            f"_k{'_'.join(map(str, kernels))}_stages{num_stages}"
+        )
 
     with mlflow.start_run(run_name=run_name):
         mlflow.log_params({
             "db": db,
             "subject": subject,
             "window_size": window_size,
+            "model_type": model_type,
             "kernels": str(kernels),
             "num_stages": num_stages,
             "epochs": epochs,
@@ -285,9 +332,12 @@ def train_and_evaluate(
         })
 
         n_channels = train_ds[0][0].shape[0]
-        model = MultiScaleEMGNet(
-            n_channels, num_classes, kernels=kernels, num_stages=num_stages
-        ).to(device)
+        if model_type == "conventional":
+            model = ConventionalCNN(n_channels, num_classes, window_size).to(device)
+        else:
+            model = MultiScaleEMGNet(
+                n_channels, num_classes, kernels=kernels, num_stages=num_stages
+            ).to(device)
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         mlflow.log_param("n_params", n_params)
 
@@ -337,6 +387,7 @@ def train_and_evaluate(
     return {
         "subject": subject,
         "window_size": window_size,
+        "model_type": model_type,
         "kernels": kernels,
         "num_stages": num_stages,
         "history": history,
@@ -358,12 +409,12 @@ def run_task(args: tuple) -> dict:
     args tuple layout:
         db, subject, kernels, window_size, num_stages, device_str,
         ninapro_dir, train_reps, test_reps, window_step, epochs, lr,
-        weight_decay, batch_size, fs, mlruns_dir, experiment
+        weight_decay, batch_size, fs, mlruns_dir, experiment, model_type
     """
     (
         db, subject, kernels, window_size, num_stages, device_str,
         ninapro_dir, train_reps, test_reps, window_step, epochs, lr,
-        weight_decay, batch_size, fs, mlruns_dir, experiment,
+        weight_decay, batch_size, fs, mlruns_dir, experiment, model_type,
     ) = args
 
     device = torch.device(device_str)
@@ -388,6 +439,7 @@ def run_task(args: tuple) -> dict:
         fs=fs,
         mlruns_dir=mlruns_dir,
         experiment=experiment,
+        model_type=model_type,
     )
     result.pop("model", None)   # not needed cross-process
     return result
