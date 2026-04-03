@@ -126,7 +126,7 @@ def detect_gpus() -> list[str]:
         )
         if r.returncode == 0:
             names = [l for l in r.stdout.strip().splitlines() if l.strip()]
-            names = [3,4,5,6]
+            names = [0,1,2,3,4,5]
             if names:
                 return [f"cuda:{i}" for i in range(len(names))]
     except Exception:
@@ -202,9 +202,9 @@ def _total_runs(cfg: dict, model_type: str) -> int:
     return n_ms + n_cv   # "both"
 
 
-def cmd_train(cfg: dict, model_type: str) -> None:
+def cmd_train(cfg: dict, model_type: str, n_workers: int | None = None) -> None:
     devices = detect_gpus()
-    n_workers = len(devices)
+    n_workers = min(n_workers, len(devices)) if n_workers else len(devices)
     print(f"Available devices : {devices}")
 
     mlflow.set_tracking_uri(cfg["mlruns_dir"])
@@ -245,7 +245,10 @@ def cmd_train(cfg: dict, model_type: str) -> None:
             print(f"  → acc={r['final_acc']:.4f}")
     else:
         # Multi-GPU: fork workers BEFORE any CUDA is initialised → safe.
-        ctx = multiprocessing.get_context("fork")
+        # Limit BLAS/OpenMP threads to 1 before fork: pywt and numpy use
+        # multi-threaded libraries whose internal threads cannot survive a fork
+        # (the child inherits a deadlocked state and gets killed by the OS).
+        ctx = multiprocessing.get_context("spawn")
         with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
             futures = {pool.submit(run_task, t): t for t in tasks}
             for i, fut in enumerate(as_completed(futures), 1):
@@ -558,6 +561,9 @@ def make_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--config",      default="config.json",
                    help="Path to config.json  (default: config.json)")
+    p.add_argument("--n-workers", dest="n_workers", type=int, default=None,
+                   help="Number of parallel workers (default: one per GPU). "
+                        "Reduce if you run out of memory.")
     p.add_argument("--ninapro-dir", dest="ninapro_dir", default=None,
                    help="Override ninapro_dir from config")
     p.add_argument("--mlruns-dir",  dest="mlruns_dir",  default=None,
@@ -568,19 +574,23 @@ def make_parser() -> argparse.ArgumentParser:
     # Dataset / search space
     p.add_argument("--db",          type=int, default=2)
     p.add_argument("--subjects",    type=int, nargs="+",
-                   default=[1, 2, 3, 4, 5, 6, 7])
+                   default=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
     p.add_argument("--conv-config", dest="conv_config", type=_kernels, nargs="+",
                    default=[(3,5,11), (5,9,19), (7,9,13), (3,11,23)])
     p.add_argument("--window-sizes",dest="window_sizes", type=int, nargs="+",
-                   default=[256, 512])
+                   default=[512])
     p.add_argument("--num-stages",  dest="num_stages",  type=int, nargs="+",
-                   default=[1, 2])
+                   default=[1])
 
     # Training hyperparameters
     p.add_argument("--train-reps",  dest="train_reps",  type=int, nargs="+",
-                   default=[1, 2, 3, 4])
+                   default=[1, 3, 4, 6],
+                   help="Train repetitions (DB2/DB5 default: 1 3 4 6; "
+                        "DB1: 1 2 4 6 7 9 10; DB7: 1 2 4 5)")
     p.add_argument("--test-reps",   dest="test_reps",   type=int, nargs="+",
-                   default=[5, 6])
+                   default=[2, 5],
+                   help="Test repetitions  (DB2/DB5 default: 2 5; "
+                        "DB1: 3 5 8; DB7: 3 6)")
     p.add_argument("--window-step", dest="window_step", type=int, default=32)
     p.add_argument("--epochs",      type=int,   default=100)
     p.add_argument("--lr",          type=float, default=1e-3)
@@ -643,7 +653,7 @@ def main() -> None:
     print()
 
     if args.command == "train":
-        cmd_train(cfg, model_type=args.model)
+        cmd_train(cfg, model_type=args.model, n_workers=args.n_workers)
 
     elif args.command == "results":
         cmd_results(cfg, plot=args.plot, save_plot=args.save_plot)

@@ -6,6 +6,9 @@ All code that runs inside subprocess workers must live here so that
 """
 
 import glob
+import logging
+import os
+import traceback
 from collections import Counter
 from pathlib import Path
 
@@ -15,7 +18,8 @@ import numpy as np
 import scipy.io as sio
 import torch
 import torch.nn as nn
-from scipy.signal import butter, sosfiltfilt
+import pywt
+from scipy.signal import butter, filtfilt, iirnotch, sosfiltfilt
 from sklearn.metrics import accuracy_score
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
@@ -59,14 +63,86 @@ def load_subject(db: int, subject: int, ninapro_dir: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Preprocessing
+# Preprocessing  (Emimal et al. 2025)
 # ---------------------------------------------------------------------------
 
-def bandpass_filter(
-    emg: np.ndarray, fs: int = 2000, low: float = 10.0, high: float = 500.0
-) -> np.ndarray:
-    sos = butter(4, [low, high], btype="bandpass", fs=fs, output="sos")
+def _lowpass_filter(emg: np.ndarray, fs: int, cutoff: float = 500.0,
+                    order: int = 4) -> np.ndarray:
+    """Butterworth low-pass filter."""
+    sos = butter(order, cutoff, btype="low", fs=fs, output="sos")
     return sosfiltfilt(sos, emg, axis=0).astype(np.float32)
+
+
+def _notch_filter(emg: np.ndarray, fs: int, freq: float = 50.0,
+                  q: float = 30.0) -> np.ndarray:
+    """IIR notch filter to remove power-line interference."""
+    b, a = iirnotch(freq, q, fs=fs)
+    return filtfilt(b, a, emg, axis=0).astype(np.float32)
+
+
+def _wavelet_denoise(emg: np.ndarray, wavelet: str = "db38",
+                     level: int = 5) -> np.ndarray:
+    """Per-channel soft-thresholding wavelet denoising.
+
+    Paper uses 'db44' (MATLAB only); db38 is the highest order available in
+    PyWavelets and is used as the closest approximation.
+    Threshold: universal Donoho-Johnstone  σ * sqrt(2 * log(N)).
+    """
+    out = np.empty_like(emg, dtype=np.float32)
+    n = emg.shape[0]
+    for ch in range(emg.shape[1]):
+        coeffs = pywt.wavedec(emg[:, ch], wavelet, level=level)
+        # Estimate noise std from finest detail band (robust via MAD)
+        sigma = np.median(np.abs(coeffs[-1])) / 0.6745
+        thr = sigma * np.sqrt(2 * np.log(max(n, 2)))
+        new_coeffs = [coeffs[0]] + [
+            pywt.threshold(c, thr, mode="soft") for c in coeffs[1:]
+        ]
+        rec = pywt.waverec(new_coeffs, wavelet)
+        out[:, ch] = rec[:n]          # waverec may add one sample
+    return out
+
+
+def preprocess_emg(emg: np.ndarray, db: int, fs: int = 2000) -> np.ndarray:
+    """Apply the preprocessing pipeline from Emimal et al. 2025:
+
+    DB2, DB7 (2 kHz): low-pass 500 Hz  →  notch 50 Hz  →  wavelet denoising
+    DB1      (100 Hz): wavelet denoising only
+    DB5      (200 Hz): wavelet denoising only
+    """
+    emg = emg.astype(np.float32)
+    if db in (2, 7):
+        emg = _lowpass_filter(emg, fs=fs, cutoff=500.0)
+        emg = _notch_filter(emg, fs=fs, freq=50.0)
+    return _wavelet_denoise(emg)
+
+
+def load_and_preprocess(db: int, subject: int, ninapro_dir: Path,
+                        fs: int = 2000) -> dict:
+    """Load a subject and apply preprocessing, with an on-disk cache.
+
+    The cache is stored as a .npz file next to the source data so that
+    parallel workers never repeat the expensive wavelet denoising step.
+    """
+    ninapro_dir = Path(ninapro_dir)
+    cache_dir = ninapro_dir / f"DB{db}" / f"DB{db}_s{subject}" / "_cache"
+    cache_path = cache_dir / f"preprocessed_fs{fs}.npz"
+
+    if cache_path.exists():
+        logging.info("Loading cached preprocessed data from %s", cache_path)
+        data = np.load(cache_path)
+        return {k: data[k] for k in data.files}
+
+    raw = load_subject(db, subject, ninapro_dir)
+    emg = preprocess_emg(raw["emg"], db=db, fs=fs)
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    np.savez(cache_path, emg=emg, stimulus=raw["stimulus"],
+             restimulus=raw["restimulus"], repetition=raw["repetition"])
+    logging.info("Saved preprocessed cache to %s", cache_path)
+
+    return dict(emg=emg, stimulus=raw["stimulus"],
+                restimulus=raw["restimulus"], repetition=raw["repetition"])
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +156,7 @@ class NinaProDatasetByRepetition(Dataset):
         subject,
         reps,
         window_size,
-        step=32,
+        step=16,
         drop_rest=True,
         ninapro_dir=None,
         label_map=None,
@@ -90,8 +166,8 @@ class NinaProDatasetByRepetition(Dataset):
         self.window_size = window_size
         self.label_map = label_map
 
-        raw = load_subject(db, subject, ninapro_dir)
-        emg = bandpass_filter(raw["emg"].astype(np.float32), fs=fs)
+        raw = load_and_preprocess(db, subject, ninapro_dir, fs=fs)
+        emg = raw["emg"]
         labels = raw["restimulus"] if raw["restimulus"].size else raw["stimulus"]
         repetition = raw["repetition"].astype(int)
         min_len = min(len(emg), len(labels), len(repetition))
@@ -210,14 +286,16 @@ class ConventionalCNN(nn.Module):
         # Using the same weights across scales is consistent with the paper
         # ("a uniform filter size has been applied across all coarse-grained signals").
         self.branch = nn.Sequential(
-            nn.Conv1d(n_channels, 32, kernel_size=7, padding=3, bias=True),
+            nn.Conv1d(n_channels, 7, kernel_size=32, padding=16, bias=True),
+            nn.BatchNorm1d(7),
             nn.ReLU(inplace=True),
             nn.MaxPool1d(kernel_size=5, stride=5),
         )
-        self.gap = nn.AdaptiveAvgPool1d(1)   # global average pool → (B, 32, 1)
+        self.gap = nn.AdaptiveAvgPool1d(1)   # global average pool → (B, 7, 1)
         self.classifier = nn.Sequential(
-            nn.Linear(32 * len(self.SCALES), 512),
+            nn.Linear(7 * len(self.SCALES), 512),
             nn.ReLU(inplace=True),
+             nn.Dropout(0.5),          
             nn.Linear(512, num_classes),
         )
 
@@ -333,7 +411,7 @@ def train_and_evaluate(
             "test_reps": str(test_reps),
         })
 
-        tmp = load_subject(db, subject, ninapro_dir)
+        tmp = load_and_preprocess(db, subject, ninapro_dir, fs=fs)
         tmp_labels = tmp["restimulus"] if tmp["restimulus"].size else tmp["stimulus"]
         tmp_reps = tmp["repetition"].astype(int)
         train_mask = np.isin(tmp_reps, train_reps)
@@ -450,11 +528,20 @@ def run_task(args: tuple) -> dict:
         weight_decay, batch_size, fs, mlruns_dir, experiment, model_type,
     ) = args
 
-    device = torch.device(device_str)
-    mlflow.set_tracking_uri(mlruns_dir)
-    mlflow.set_experiment(experiment)
+    # Write full traceback to a per-worker log file so pool crashes are visible
+    log_path = Path(ninapro_dir).parent / f"worker_db{db}_s{subject}_{model_type}.log"
+    logging.basicConfig(
+        filename=str(log_path), level=logging.DEBUG,
+        format="%(asctime)s %(levelname)s %(message)s", force=True,
+    )
+    logging.info("run_task started: %s", args[:6])
 
-    result = train_and_evaluate(
+    try:
+        device = torch.device(device_str)
+        mlflow.set_tracking_uri(mlruns_dir)
+        mlflow.set_experiment(experiment)
+
+        result = train_and_evaluate(
         db=db,
         subject=subject,
         window_size=window_size,
@@ -469,10 +556,14 @@ def run_task(args: tuple) -> dict:
         lr=lr,
         weight_decay=weight_decay,
         batch_size=batch_size,
-        fs=fs,
-        mlruns_dir=mlruns_dir,
-        experiment=experiment,
-        model_type=model_type,
-    )
-    result.pop("model", None)   # not needed cross-process
-    return result
+            fs=fs,
+            mlruns_dir=mlruns_dir,
+            experiment=experiment,
+            model_type=model_type,
+        )
+        result.pop("model", None)   # not needed cross-process
+        logging.info("run_task finished: acc=%.4f", result["final_acc"])
+        return result
+    except Exception:
+        logging.error("run_task FAILED:\n%s", traceback.format_exc())
+        raise
