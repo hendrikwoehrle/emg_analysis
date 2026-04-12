@@ -122,15 +122,14 @@ def detect_gpus() -> list[str]:
         import subprocess
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=20,
         )
         if r.returncode == 0:
             names = [l for l in r.stdout.strip().splitlines() if l.strip()]
-            names = [0,1,2,3,4,5]
             if names:
                 return [f"cuda:{i}" for i in range(len(names))]
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"GPU detection failed: {e}")
 
     if torch.backends.mps.is_available():
         return ["mps"]
