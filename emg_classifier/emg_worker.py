@@ -288,14 +288,14 @@ class ConventionalCNN(nn.Module):
         # Using the same weights across scales is consistent with the paper
         # ("a uniform filter size has been applied across all coarse-grained signals").
         self.branch = nn.Sequential(
-            nn.Conv1d(n_channels, 7, kernel_size=32, padding=16, bias=True),
-            nn.BatchNorm1d(7),
+            nn.Conv1d(n_channels, 32, kernel_size=7, padding=3, bias=True),
+            nn.BatchNorm1d(32),
             nn.ReLU(inplace=True),
             nn.MaxPool1d(kernel_size=5, stride=5),
         )
-        self.gap = nn.AdaptiveAvgPool1d(1)   # global average pool → (B, 7, 1)
+        self.gap = nn.AdaptiveAvgPool1d(1)   # global average pool → (B, 32, 1)
         self.classifier = nn.Sequential(
-            nn.Linear(7 * len(self.SCALES), 512),
+            nn.Linear(32 * len(self.SCALES), 512),
             nn.ReLU(inplace=True),     
             nn.Linear(512, num_classes),
         )

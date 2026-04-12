@@ -579,7 +579,7 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--conv-config", dest="conv_config", type=_kernels, nargs="+",
                    default=[(3,5,11), (5,9,19), (7,9,13), (3,11,23)])
     p.add_argument("--window-sizes",dest="window_sizes", type=int, nargs="+",
-                   default=[512])
+                   default=[400])
     p.add_argument("--num-stages",  dest="num_stages",  type=int, nargs="+",
                    default=[1])
 
