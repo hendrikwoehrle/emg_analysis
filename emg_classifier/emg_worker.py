@@ -21,6 +21,7 @@ import torch.nn as nn
 import pywt
 from scipy.signal import butter, filtfilt, iirnotch, sosfiltfilt
 from sklearn.metrics import accuracy_score
+from sklearn.model_selection import train_test_split
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset
 
@@ -175,8 +176,9 @@ class NinaProDatasetByRepetition(Dataset):
         labels = labels[:min_len]
         repetition = repetition[:min_len]
 
-        mask = np.isin(repetition, reps)
-        emg, labels = emg[mask], labels[mask]
+        if reps is not None:
+            mask = np.isin(repetition, reps)
+            emg, labels = emg[mask], labels[mask]
 
         if channel_stats is None:
             self.mean = emg.mean(axis=0, keepdims=True)
@@ -294,8 +296,7 @@ class ConventionalCNN(nn.Module):
         self.gap = nn.AdaptiveAvgPool1d(1)   # global average pool → (B, 7, 1)
         self.classifier = nn.Sequential(
             nn.Linear(7 * len(self.SCALES), 512),
-            nn.ReLU(inplace=True),
-             nn.Dropout(0.5),          
+            nn.ReLU(inplace=True),     
             nn.Linear(512, num_classes),
         )
 
@@ -379,13 +380,17 @@ def train_and_evaluate(
     mlruns_dir: str,
     experiment: str,
     model_type: str = "multiscale",
+    split_mode: str = "repetition",
 ) -> dict:
     """Train and evaluate one subject.
 
     Args:
-        model_type: ``"multiscale"`` for MultiScaleEMGNet (default) or
-                    ``"conventional"`` for the ConventionalCNN baseline
-                    from Emimal et al. 2025.
+        model_type:  ``"multiscale"`` or ``"conventional"``.
+        split_mode:  ``"repetition"`` (default) — train/test split by
+                     repetition index, realistic evaluation.
+                     ``"sample"`` — random 70/30 window-level split
+                     matching the original paper's methodology (leaky but
+                     reproduces the reported numbers).
     """
     if model_type == "conventional":
         run_name = f"db{db}_s{subject}_w{window_size}_conventional"
@@ -394,6 +399,8 @@ def train_and_evaluate(
             f"db{db}_s{subject}_w{window_size}"
             f"_k{'_'.join(map(str, kernels))}_stages{num_stages}"
         )
+    if split_mode == "sample":
+        run_name += "_samplesplit"
 
     with mlflow.start_run(run_name=run_name):
         mlflow.log_params({
@@ -407,6 +414,7 @@ def train_and_evaluate(
             "lr": lr,
             "weight_decay": weight_decay,
             "batch_size": batch_size,
+            "split_mode": split_mode,
             "train_reps": str(train_reps),
             "test_reps": str(test_reps),
         })
@@ -414,22 +422,42 @@ def train_and_evaluate(
         tmp = load_and_preprocess(db, subject, ninapro_dir, fs=fs)
         tmp_labels = tmp["restimulus"] if tmp["restimulus"].size else tmp["stimulus"]
         tmp_reps = tmp["repetition"].astype(int)
-        train_mask = np.isin(tmp_reps, train_reps)
-        all_labels = sorted(int(c) for c in np.unique(tmp_labels[train_mask]) if c > 0)
+
+        if split_mode == "sample":
+            # Use ALL repetitions; build label map from all non-rest labels
+            all_labels = sorted(int(c) for c in np.unique(tmp_labels) if c > 0)
+        else:
+            train_mask = np.isin(tmp_reps, train_reps)
+            all_labels = sorted(int(c) for c in np.unique(tmp_labels[train_mask]) if c > 0)
         label_map = {orig: new for new, orig in enumerate(all_labels)}
         num_classes = len(label_map)
 
-        train_ds = NinaProDatasetByRepetition(
-            db, subject, train_reps,
-            window_size=window_size, step=window_step,
-            label_map=label_map, ninapro_dir=ninapro_dir, fs=fs,
-        )
-        test_ds = NinaProDatasetByRepetition(
-            db, subject, test_reps,
-            window_size=window_size, step=window_step,
-            label_map=label_map, ninapro_dir=ninapro_dir, fs=fs,
-            channel_stats=train_ds.channel_stats,
-        )
+        if split_mode == "sample":
+            # Build full dataset (all reps), then split windows 70/30 randomly
+            full_ds = NinaProDatasetByRepetition(
+                db, subject, reps=None,
+                window_size=window_size, step=window_step,
+                label_map=label_map, ninapro_dir=ninapro_dir, fs=fs,
+            )
+            n = len(full_ds)
+            train_idx, test_idx = train_test_split(
+                range(n), test_size=0.3, random_state=42, shuffle=True,
+            )
+            from torch.utils.data import Subset
+            train_ds = Subset(full_ds, train_idx)
+            test_ds  = Subset(full_ds, test_idx)
+        else:
+            train_ds = NinaProDatasetByRepetition(
+                db, subject, train_reps,
+                window_size=window_size, step=window_step,
+                label_map=label_map, ninapro_dir=ninapro_dir, fs=fs,
+            )
+            test_ds = NinaProDatasetByRepetition(
+                db, subject, test_reps,
+                window_size=window_size, step=window_step,
+                label_map=label_map, ninapro_dir=ninapro_dir, fs=fs,
+                channel_stats=train_ds.channel_stats,
+            )
 
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                                   num_workers=0, pin_memory=True)
@@ -520,12 +548,14 @@ def run_task(args: tuple) -> dict:
     args tuple layout:
         db, subject, kernels, window_size, num_stages, device_str,
         ninapro_dir, train_reps, test_reps, window_step, epochs, lr,
-        weight_decay, batch_size, fs, mlruns_dir, experiment, model_type
+        weight_decay, batch_size, fs, mlruns_dir, experiment, model_type,
+        split_mode
     """
     (
         db, subject, kernels, window_size, num_stages, device_str,
         ninapro_dir, train_reps, test_reps, window_step, epochs, lr,
         weight_decay, batch_size, fs, mlruns_dir, experiment, model_type,
+        split_mode,
     ) = args
 
     # Write full traceback to a per-worker log file so pool crashes are visible
@@ -560,6 +590,7 @@ def run_task(args: tuple) -> dict:
             mlruns_dir=mlruns_dir,
             experiment=experiment,
             model_type=model_type,
+            split_mode=split_mode,
         )
         result.pop("model", None)   # not needed cross-process
         logging.info("run_task finished: acc=%.4f", result["final_acc"])

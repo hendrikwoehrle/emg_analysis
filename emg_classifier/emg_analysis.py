@@ -201,7 +201,8 @@ def _total_runs(cfg: dict, model_type: str) -> int:
     return n_ms + n_cv   # "both"
 
 
-def cmd_train(cfg: dict, model_type: str, n_workers: int | None = None) -> None:
+def cmd_train(cfg: dict, model_type: str, n_workers: int | None = None,
+              split_mode: str = "repetition") -> None:
     devices = detect_gpus()
     n_workers = min(n_workers, len(devices)) if n_workers else len(devices)
     print(f"Available devices : {devices}")
@@ -229,17 +230,18 @@ def cmd_train(cfg: dict, model_type: str, n_workers: int | None = None) -> None:
             str(cfg["ninapro_dir"]),
             cfg["train_reps"], cfg["test_reps"], cfg["window_step"],
             cfg["epochs"], cfg["lr"], cfg["weight_decay"], cfg["batch_size"],
-            cfg["fs"], cfg["mlruns_dir"], cfg["experiment"], p[4],
+            cfg["fs"], cfg["mlruns_dir"], cfg["experiment"], p[4], split_mode,
         )
         for idx, p in enumerate(pending)
     ]
 
     if n_workers == 1:
         for i, t in enumerate(tasks, 1):
-            subject, kernels, window_size, num_stages, mtype = t[1], t[2], t[3], t[4], t[17]
+            subject, kernels, window_size, num_stages, mtype, smode = \
+                t[1], t[2], t[3], t[4], t[17], t[18]
             extra = f"  kernels={kernels}  stages={num_stages}" if mtype == "multiscale" else ""
             print(f"[{i}/{len(tasks)}] subject={subject}  model={mtype}  "
-                  f"window={window_size}{extra}  device={t[5]}")
+                  f"split={smode}  window={window_size}{extra}  device={t[5]}")
             r = run_task(t)
             print(f"  → acc={r['final_acc']:.4f}")
     else:
@@ -606,6 +608,11 @@ def make_parser() -> argparse.ArgumentParser:
     tp.add_argument("--model", choices=["multiscale", "conventional", "both"],
                     default="both",
                     help="Which model(s) to train (default: both)")
+    tp.add_argument("--split", dest="split_mode",
+                    choices=["repetition", "sample"], default="repetition",
+                    help="'repetition' (default): train/test split by rep index — "
+                         "realistic. 'sample': random 70/30 window-level split "
+                         "matching the paper (data leakage, higher accuracy).")
 
     # ── results ────────────────────────────────────────────────────────────
     rp = sub.add_parser("results", help="Print ranked results from MLflow.")
@@ -652,7 +659,8 @@ def main() -> None:
     print()
 
     if args.command == "train":
-        cmd_train(cfg, model_type=args.model, n_workers=args.n_workers)
+        cmd_train(cfg, model_type=args.model, n_workers=args.n_workers,
+                  split_mode=args.split_mode)
 
     elif args.command == "results":
         cmd_results(cfg, plot=args.plot, save_plot=args.save_plot)
