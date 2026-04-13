@@ -101,6 +101,8 @@ def build_config(args: argparse.Namespace) -> dict:
         conv_config    = [tuple(k) for k in args.conv_config],
         window_sizes   = args.window_sizes,
         num_stages     = args.num_stages,
+        dropouts       = args.dropout,
+        conv_blocks    = args.conv_blocks,
         train_reps     = args.train_reps,
         test_reps      = args.test_reps,
         window_step    = args.window_step,
@@ -158,42 +160,55 @@ def get_finished_runs(mlruns_dir: str, experiment: str) -> set[str]:
 # ===========================================================================
 
 def run_name_for(db, subject, window_size, kernels, num_stages,
-                 model_type: str = "multiscale") -> str:
+                 model_type: str = "multiscale", dropout: float = 0.5,
+                 num_conv_blocks: int = 1) -> str:
+    do = f"_do{dropout}"
     if model_type == "conventional":
-        return f"db{db}_s{subject}_w{window_size}_conventional"
-    return f"db{db}_s{subject}_w{window_size}_k{'_'.join(map(str, kernels))}_stages{num_stages}"
+        return f"db{db}_s{subject}_w{window_size}_conventional_b{num_conv_blocks}{do}"
+    return (f"db{db}_s{subject}_w{window_size}"
+            f"_k{'_'.join(map(str, kernels))}_stages{num_stages}{do}")
 
 
 def _build_pending(cfg: dict, model_type: str, finished: set) -> list:
-    """Return list of (subject, kernels, window_size, num_stages, model_type) tuples."""
+    """Return list of (subject, kernels, window_size, num_stages, model_type, dropout, num_conv_blocks)."""
     pending = []
     db = cfg["db"]
 
     if model_type in ("multiscale", "both"):
         combos = list(itertools.product(cfg["conv_config"],
                                         cfg["window_sizes"],
-                                        cfg["num_stages"]))
+                                        cfg["num_stages"],
+                                        cfg["dropouts"]))
         for subject in cfg["subjects"]:
-            for kernels, window_size, num_stages in combos:
+            for kernels, window_size, num_stages, dropout in combos:
                 if run_name_for(db, subject, window_size, kernels, num_stages,
-                                "multiscale") not in finished:
-                    pending.append((subject, kernels, window_size, num_stages, "multiscale"))
+                                "multiscale", dropout, 1) not in finished:
+                    pending.append(
+                        (subject, kernels, window_size, num_stages, "multiscale", dropout, 1)
+                    )
 
     if model_type in ("conventional", "both"):
+        combos = list(itertools.product(cfg["window_sizes"],
+                                        cfg["dropouts"],
+                                        cfg["conv_blocks"]))
         for subject in cfg["subjects"]:
-            for window_size in cfg["window_sizes"]:
+            for window_size, dropout, num_conv_blocks in combos:
                 if run_name_for(db, subject, window_size, None, None,
-                                "conventional") not in finished:
-                    # kernels/num_stages unused for conventional; pass placeholders
-                    pending.append((subject, (3, 5, 11), window_size, 1, "conventional"))
+                                "conventional", dropout, num_conv_blocks) not in finished:
+                    pending.append(
+                        (subject, (3, 5, 11), window_size, 1, "conventional",
+                         dropout, num_conv_blocks)
+                    )
 
     return pending
 
 
 def _total_runs(cfg: dict, model_type: str) -> int:
+    n_do = len(cfg["dropouts"])
     n_ms = (len(cfg["subjects"]) * len(cfg["conv_config"])
-            * len(cfg["window_sizes"]) * len(cfg["num_stages"]))
-    n_cv = len(cfg["subjects"]) * len(cfg["window_sizes"])
+            * len(cfg["window_sizes"]) * len(cfg["num_stages"]) * n_do)
+    n_cv = (len(cfg["subjects"]) * len(cfg["window_sizes"])
+            * n_do * len(cfg["conv_blocks"]))
     if model_type == "multiscale":
         return n_ms
     if model_type == "conventional":
@@ -202,10 +217,10 @@ def _total_runs(cfg: dict, model_type: str) -> int:
 
 
 def cmd_train(cfg: dict, model_type: str, n_workers: int | None = None,
-              split_mode: str = "repetition", num_conv_blocks: int = 1) -> None:
+              split_mode: str = "repetition") -> None:
     devices = detect_gpus()
-    n_workers = min(n_workers, len(devices)) if n_workers else len(devices)
-    print(f"Available devices : {devices}")
+    n_workers = n_workers if n_workers else len(devices)
+    print(f"Available devices : {devices}  ({len(devices)} GPUs, {n_workers} workers)")
 
     mlflow.set_tracking_uri(cfg["mlruns_dir"])
     mlflow.set_experiment(cfg["experiment"])
@@ -226,12 +241,12 @@ def cmd_train(cfg: dict, model_type: str, n_workers: int | None = None,
     tasks = [
         (
             cfg["db"], p[0], p[1], p[2], p[3],
-            devices[idx % n_workers],
+            devices[idx % len(devices)],
             str(cfg["ninapro_dir"]),
             cfg["train_reps"], cfg["test_reps"], cfg["window_step"],
             cfg["epochs"], cfg["lr"], cfg["weight_decay"], cfg["batch_size"],
             cfg["fs"], cfg["mlruns_dir"], cfg["experiment"], p[4], split_mode,
-            num_conv_blocks,
+            p[6], p[5],
         )
         for idx, p in enumerate(pending)
     ]
@@ -427,31 +442,30 @@ def _throughput_ms(model: nn.Module, loader: DataLoader, n_batches: int = 20) ->
 
 def quantize_ptq(fp32_model: nn.Module, calib_loader: DataLoader,
                  n_calib_batches: int) -> nn.Module:
-    import torch.ao.quantization as tq
+    from torch.ao.quantization import get_default_qconfig_mapping
+    from torch.ao.quantization.quantize_fx import convert_fx, prepare_fx
+
+    example_input = next(iter(calib_loader))[0]
     model = copy.deepcopy(fp32_model).cpu().eval()
-    for _, module in model.named_modules():
-        if isinstance(module, ConvBnRelu):
-            tq.fuse_modules(module, [["0", "1", "2"]], inplace=True)
-    model.qconfig = tq.get_default_qconfig("x86")
-    tq.prepare(model, inplace=True)
+    qconfig_mapping = get_default_qconfig_mapping("x86")
+    model = prepare_fx(model, qconfig_mapping, example_input)
     with torch.no_grad():
         for i, (x, _) in enumerate(calib_loader):
             model(x)
             if i + 1 >= n_calib_batches:
                 break
-    tq.convert(model, inplace=True)
-    return model
+    return convert_fx(model)
 
 
 def quantize_qat(fp32_model: nn.Module, train_loader: DataLoader,
                  test_loader: DataLoader, epochs: int, lr: float) -> nn.Module:
-    import torch.ao.quantization as tq
-    model = copy.deepcopy(fp32_model).cpu().train()
-    for _, module in model.named_modules():
-        if isinstance(module, ConvBnRelu):
-            tq.fuse_modules(module, [["0", "1", "2"]], inplace=True)
-    model.qconfig = tq.get_default_qat_qconfig("x86")
-    tq.prepare_qat(model, inplace=True)
+    from torch.ao.quantization import get_default_qat_qconfig_mapping
+    from torch.ao.quantization.quantize_fx import convert_fx, prepare_qat_fx
+
+    example_input = next(iter(train_loader))[0]
+    model = copy.deepcopy(fp32_model).cpu()
+    qconfig_mapping = get_default_qat_qconfig_mapping("x86")
+    model = prepare_qat_fx(model, qconfig_mapping, example_input)
 
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -469,16 +483,11 @@ def quantize_qat(fp32_model: nn.Module, train_loader: DataLoader,
             correct += (logits.argmax(1) == y).sum().item()
             n += len(y)
         scheduler.step()
-        if epoch == max(1, int(epochs * 0.6)):
-            model.apply(tq.disable_observer)
-        if epoch == max(1, int(epochs * 0.8)):
-            model.apply(nn.intrinsic.qat.freeze_bn_stats)
         val_acc = _evaluate_cpu(model, test_loader)
         print(f"  QAT epoch {epoch:3d}/{epochs}  train={correct/n:.3f}  val={val_acc:.3f}")
 
     model.eval()
-    tq.convert(model, inplace=True)
-    return model
+    return convert_fx(model)
 
 
 def cmd_quantize(cfg: dict, subject: int, kernels: tuple, window_size: int,
@@ -565,7 +574,8 @@ def make_parser() -> argparse.ArgumentParser:
                    help="Path to config.json  (default: config.json)")
     p.add_argument("--n-workers", dest="n_workers", type=int, default=None,
                    help="Number of parallel workers (default: one per GPU). "
-                        "Reduce if you run out of memory.")
+                        "Can exceed the number of GPUs — workers share GPUs "
+                        "round-robin, useful on large GPUs like H100.")
     p.add_argument("--ninapro-dir", dest="ninapro_dir", default=None,
                    help="Override ninapro_dir from config")
     p.add_argument("--mlruns-dir",  dest="mlruns_dir",  default=None,
@@ -614,10 +624,15 @@ def make_parser() -> argparse.ArgumentParser:
                     help="'repetition' (default): train/test split by rep index — "
                          "realistic. 'sample': random 70/30 window-level split "
                          "matching the paper (data leakage, higher accuracy).")
-    tp.add_argument("--conv-blocks", dest="num_conv_blocks", type=int,
-                    choices=[1, 2], default=1,
-                    help="Number of Conv/BN/ReLU/MaxPool blocks in ConventionalCNN "
-                         "(default: 1). Ignored for multiscale model.")
+    tp.add_argument("--conv-blocks", dest="conv_blocks", type=int, nargs="+",
+                    default=[1],
+                    help="Conv block count(s) to sweep for ConventionalCNN, 1–10 "
+                         "(default: 1). E.g. --conv-blocks 1 2 4. "
+                         "Ignored for multiscale model.")
+    tp.add_argument("--dropout", type=float, nargs="+", default=[0.5],
+                    help="Dropout rate(s) to evaluate (default: 0.5). "
+                         "Multiple values create separate runs, e.g. --dropout 0.1 0.3 0.5."
+                         " Applied to both ConventionalCNN and MultiScaleEMGNet.")
 
     # ── results ────────────────────────────────────────────────────────────
     rp = sub.add_parser("results", help="Print ranked results from MLflow.")
@@ -665,7 +680,7 @@ def main() -> None:
 
     if args.command == "train":
         cmd_train(cfg, model_type=args.model, n_workers=args.n_workers,
-                  split_mode=args.split_mode, num_conv_blocks=args.num_conv_blocks)
+                  split_mode=args.split_mode)
 
     elif args.command == "results":
         cmd_results(cfg, plot=args.plot, save_plot=args.save_plot)

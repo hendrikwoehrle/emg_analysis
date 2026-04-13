@@ -7,7 +7,6 @@ All code that runs inside subprocess workers must live here so that
 
 import glob
 import logging
-import os
 import traceback
 from collections import Counter
 from pathlib import Path
@@ -265,47 +264,69 @@ def _coarse_grain(x: torch.Tensor, scale: int) -> torch.Tensor:
 class ConventionalCNN(nn.Module):
     """Multi-scale coarse-grained CNN from Emimal et al. 2025 (3 scales, no attention).
 
-    Implements the "3 Scales + no attention" ablation from Table 2 / Fig. 1.
+    Implements the "3 Scales + no attention" ablation from Table 2 / Fig. 1,
+    extended to support up to 10 conv blocks.
 
-    Pipeline:
-        For each scale s in {1, 2, 3}:
-            coarse-grain x → c^(s)  shape (B, C, W//s)          [Eq. 1]
-            Conv1d(C → 32, kernel=7, same-pad) → ReLU
-            MaxPool1d(5)                                          [Eq. 4-5]
-            GlobalAveragePool → r^(s)  shape (B, 32)             [Eq. 6]
-        Concatenate [r^(1), r^(2), r^(3)] → shape (B, 96)       [Eq. 7]
-        Linear(96 → 512) → ReLU
-        Linear(512 → num_classes)
+    Filter schedule (VGG-style doubling every 2 blocks, capped at 256):
+        blocks 1–2: 32,  blocks 3–4: 64,  blocks 5–6: 128,  blocks 7+: 256
 
-    Reference: Emimal et al. 2025, Sec. 2.3–2.4, Fig. 1, Table 2.
+    Kernel schedule (larger receptive field in early, finer in deep layers):
+        blocks 1–2: k=7,  blocks 3–4: k=5,  blocks 5+: k=3
+
+    Pooling: MaxPool(2) after every 2nd block to preserve temporal dimension
+        (MaxPool(5) every block would collapse 400 samples by block 3).
+
+    Pipeline per scale s ∈ {1, 2, 3}:
+        coarse-grain x → c^(s)   [Eq. 1]
+        num_blocks × (Conv → BN → ReLU [→ MaxPool(2) every 2nd block])
+        GlobalAveragePool → r^(s)
+    Concatenate scales → Linear(last_ch*3 → 512) → ReLU → Dropout → Linear → out
     """
 
     SCALES = (1, 2, 3)
+    # kernel size per block index (0-based), capped at last value for deeper nets
+    _KERNELS = [7, 7, 5, 5, 3, 3, 3, 3, 3, 3]
 
-    def __init__(self, n_channels: int, num_classes: int, num_blocks: int = 1):
+    @staticmethod
+    def _filters(block_idx: int) -> int:
+        """32 → 64 → 128 → 256 (doubles every 2 blocks, cap 256)."""
+        return min(32 * (2 ** (block_idx // 2)), 256)
+
+    def __init__(self, n_channels: int, num_classes: int, num_blocks: int = 1,
+                 dropout: float = 0.5):
         super().__init__()
-        assert num_blocks in (1, 2), "num_blocks must be 1 or 2"
-        # One shared branch applied independently to each coarse-grained scale.
-        layers = [
-            nn.Conv1d(n_channels, 32, kernel_size=7, padding=3, bias=False),
-            nn.BatchNorm1d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool1d(kernel_size=5, stride=5),
-        ]
-        if num_blocks == 2:
+        assert 1 <= num_blocks <= 10, "num_blocks must be between 1 and 10"
+
+        # Shared branch applied independently to each coarse-grained scale.
+        layers: list[nn.Module] = []
+        in_ch = n_channels
+        for i in range(num_blocks):
+            out_ch = self._filters(i)
+            k = self._KERNELS[i]
             layers += [
-                nn.Conv1d(32, 32, kernel_size=7, padding=3, bias=False),
-                nn.BatchNorm1d(32),
+                nn.Conv1d(in_ch, out_ch, kernel_size=k, padding=k // 2, bias=False),
+                nn.BatchNorm1d(out_ch),
                 nn.ReLU(inplace=True),
-                nn.MaxPool1d(kernel_size=5, stride=5),
             ]
+            if (i + 1) % 2 == 0:          # pool after every 2nd block
+                layers.append(nn.MaxPool1d(kernel_size=2, stride=2))
+            in_ch = out_ch
         self.branch = nn.Sequential(*layers)
         self.gap = nn.AdaptiveAvgPool1d(1)
         self.classifier = nn.Sequential(
-            nn.Linear(32 * len(self.SCALES), 512),
+            nn.Linear(out_ch * len(self.SCALES), 512),
             nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
             nn.Linear(512, num_classes),
         )
+
+        # Kaiming Normal initialisation (same as MultiScaleEMGNet)
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (B, C, W)
@@ -389,6 +410,7 @@ def train_and_evaluate(
     model_type: str = "multiscale",
     split_mode: str = "repetition",
     num_conv_blocks: int = 1,
+    dropout: float = 0.5,
 ) -> dict:
     """Train and evaluate one subject.
 
@@ -424,6 +446,8 @@ def train_and_evaluate(
             "batch_size": batch_size,
             "split_mode": split_mode,
             "num_conv_blocks": num_conv_blocks,
+            "dropout": dropout,
+            "initialization": "kaiming_normal",
             "train_reps": str(train_reps),
             "test_reps": str(test_reps),
         })
@@ -482,10 +506,12 @@ def train_and_evaluate(
         n_channels = train_ds[0][0].shape[0]
         if model_type == "conventional":
             model = ConventionalCNN(n_channels, num_classes,
-                                    num_blocks=num_conv_blocks).to(device)
+                                    num_blocks=num_conv_blocks,
+                                    dropout=dropout).to(device)
         else:
             model = MultiScaleEMGNet(
-                n_channels, num_classes, kernels=kernels, num_stages=num_stages
+                n_channels, num_classes, kernels=kernels, num_stages=num_stages,
+                dropout=dropout
             ).to(device)
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         mlflow.log_param("n_params", n_params)
@@ -559,13 +585,13 @@ def run_task(args: tuple) -> dict:
         db, subject, kernels, window_size, num_stages, device_str,
         ninapro_dir, train_reps, test_reps, window_step, epochs, lr,
         weight_decay, batch_size, fs, mlruns_dir, experiment, model_type,
-        split_mode, num_conv_blocks
+        split_mode, num_conv_blocks, dropout
     """
     (
         db, subject, kernels, window_size, num_stages, device_str,
         ninapro_dir, train_reps, test_reps, window_step, epochs, lr,
         weight_decay, batch_size, fs, mlruns_dir, experiment, model_type,
-        split_mode, num_conv_blocks,
+        split_mode, num_conv_blocks, dropout,
     ) = args
 
     # Write full traceback to a per-worker log file so pool crashes are visible
@@ -602,6 +628,7 @@ def run_task(args: tuple) -> dict:
             model_type=model_type,
             split_mode=split_mode,
             num_conv_blocks=num_conv_blocks,
+            dropout=dropout,
         )
         result.pop("model", None)   # not needed cross-process
         logging.info("run_task finished: acc=%.4f", result["final_acc"])
