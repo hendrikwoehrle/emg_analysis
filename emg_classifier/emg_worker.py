@@ -282,21 +282,28 @@ class ConventionalCNN(nn.Module):
 
     SCALES = (1, 2, 3)
 
-    def __init__(self, n_channels: int, num_classes: int):
+    def __init__(self, n_channels: int, num_classes: int, num_blocks: int = 1):
         super().__init__()
-        # One shared Conv+Pool branch applied independently to each scale.
-        # Using the same weights across scales is consistent with the paper
-        # ("a uniform filter size has been applied across all coarse-grained signals").
-        self.branch = nn.Sequential(
-            nn.Conv1d(n_channels, 32, kernel_size=7, padding=3, bias=True),
+        assert num_blocks in (1, 2), "num_blocks must be 1 or 2"
+        # One shared branch applied independently to each coarse-grained scale.
+        layers = [
+            nn.Conv1d(n_channels, 32, kernel_size=7, padding=3, bias=False),
             nn.BatchNorm1d(32),
             nn.ReLU(inplace=True),
             nn.MaxPool1d(kernel_size=5, stride=5),
-        )
-        self.gap = nn.AdaptiveAvgPool1d(1)   # global average pool → (B, 32, 1)
+        ]
+        if num_blocks == 2:
+            layers += [
+                nn.Conv1d(32, 32, kernel_size=7, padding=3, bias=False),
+                nn.BatchNorm1d(32),
+                nn.ReLU(inplace=True),
+                nn.MaxPool1d(kernel_size=5, stride=5),
+            ]
+        self.branch = nn.Sequential(*layers)
+        self.gap = nn.AdaptiveAvgPool1d(1)
         self.classifier = nn.Sequential(
             nn.Linear(32 * len(self.SCALES), 512),
-            nn.ReLU(inplace=True),     
+            nn.ReLU(inplace=True),
             nn.Linear(512, num_classes),
         )
 
@@ -304,10 +311,10 @@ class ConventionalCNN(nn.Module):
         # x: (B, C, W)
         scale_feats = []
         for s in self.SCALES:
-            c_s = _coarse_grain(x, s)                   # (B, C, W//s)
-            r_s = self.gap(self.branch(c_s)).squeeze(-1) # (B, 32)
+            c_s = _coarse_grain(x, s)                    # (B, C, W//s)
+            r_s = self.gap(self.branch(c_s)).squeeze(-1)  # (B, 32)
             scale_feats.append(r_s)
-        r = torch.cat(scale_feats, dim=1)               # (B, 96)
+        r = torch.cat(scale_feats, dim=1)                # (B, 96)
         return self.classifier(r)
 
 
@@ -381,6 +388,7 @@ def train_and_evaluate(
     experiment: str,
     model_type: str = "multiscale",
     split_mode: str = "repetition",
+    num_conv_blocks: int = 1,
 ) -> dict:
     """Train and evaluate one subject.
 
@@ -393,7 +401,7 @@ def train_and_evaluate(
                      reproduces the reported numbers).
     """
     if model_type == "conventional":
-        run_name = f"db{db}_s{subject}_w{window_size}_conventional"
+        run_name = f"db{db}_s{subject}_w{window_size}_conventional_b{num_conv_blocks}"
     else:
         run_name = (
             f"db{db}_s{subject}_w{window_size}"
@@ -415,6 +423,7 @@ def train_and_evaluate(
             "weight_decay": weight_decay,
             "batch_size": batch_size,
             "split_mode": split_mode,
+            "num_conv_blocks": num_conv_blocks,
             "train_reps": str(train_reps),
             "test_reps": str(test_reps),
         })
@@ -472,7 +481,8 @@ def train_and_evaluate(
 
         n_channels = train_ds[0][0].shape[0]
         if model_type == "conventional":
-            model = ConventionalCNN(n_channels, num_classes).to(device)
+            model = ConventionalCNN(n_channels, num_classes,
+                                    num_blocks=num_conv_blocks).to(device)
         else:
             model = MultiScaleEMGNet(
                 n_channels, num_classes, kernels=kernels, num_stages=num_stages
@@ -549,13 +559,13 @@ def run_task(args: tuple) -> dict:
         db, subject, kernels, window_size, num_stages, device_str,
         ninapro_dir, train_reps, test_reps, window_step, epochs, lr,
         weight_decay, batch_size, fs, mlruns_dir, experiment, model_type,
-        split_mode
+        split_mode, num_conv_blocks
     """
     (
         db, subject, kernels, window_size, num_stages, device_str,
         ninapro_dir, train_reps, test_reps, window_step, epochs, lr,
         weight_decay, batch_size, fs, mlruns_dir, experiment, model_type,
-        split_mode,
+        split_mode, num_conv_blocks,
     ) = args
 
     # Write full traceback to a per-worker log file so pool crashes are visible
@@ -591,6 +601,7 @@ def run_task(args: tuple) -> dict:
             experiment=experiment,
             model_type=model_type,
             split_mode=split_mode,
+            num_conv_blocks=num_conv_blocks,
         )
         result.pop("model", None)   # not needed cross-process
         logging.info("run_task finished: acc=%.4f", result["final_acc"])

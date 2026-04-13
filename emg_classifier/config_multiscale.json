@@ -1,0 +1,7 @@
+{
+  "ninapro_dir": "/ai_workspace/hwoehrle/data/ninapro",
+  "mlruns_dir": "/ai_workspace/hwoehrle/mlruns",
+  "mlflow_experiment": "ninapro_emg_multiscale"
+}
+ 
+ 

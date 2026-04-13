@@ -202,7 +202,7 @@ def _total_runs(cfg: dict, model_type: str) -> int:
 
 
 def cmd_train(cfg: dict, model_type: str, n_workers: int | None = None,
-              split_mode: str = "repetition") -> None:
+              split_mode: str = "repetition", num_conv_blocks: int = 1) -> None:
     devices = detect_gpus()
     n_workers = min(n_workers, len(devices)) if n_workers else len(devices)
     print(f"Available devices : {devices}")
@@ -231,6 +231,7 @@ def cmd_train(cfg: dict, model_type: str, n_workers: int | None = None,
             cfg["train_reps"], cfg["test_reps"], cfg["window_step"],
             cfg["epochs"], cfg["lr"], cfg["weight_decay"], cfg["batch_size"],
             cfg["fs"], cfg["mlruns_dir"], cfg["experiment"], p[4], split_mode,
+            num_conv_blocks,
         )
         for idx, p in enumerate(pending)
     ]
@@ -613,6 +614,10 @@ def make_parser() -> argparse.ArgumentParser:
                     help="'repetition' (default): train/test split by rep index — "
                          "realistic. 'sample': random 70/30 window-level split "
                          "matching the paper (data leakage, higher accuracy).")
+    tp.add_argument("--conv-blocks", dest="num_conv_blocks", type=int,
+                    choices=[1, 2], default=1,
+                    help="Number of Conv/BN/ReLU/MaxPool blocks in ConventionalCNN "
+                         "(default: 1). Ignored for multiscale model.")
 
     # ── results ────────────────────────────────────────────────────────────
     rp = sub.add_parser("results", help="Print ranked results from MLflow.")
@@ -660,7 +665,7 @@ def main() -> None:
 
     if args.command == "train":
         cmd_train(cfg, model_type=args.model, n_workers=args.n_workers,
-                  split_mode=args.split_mode)
+                  split_mode=args.split_mode, num_conv_blocks=args.num_conv_blocks)
 
     elif args.command == "results":
         cmd_results(cfg, plot=args.plot, save_plot=args.save_plot)
