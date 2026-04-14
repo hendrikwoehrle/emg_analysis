@@ -61,7 +61,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
 from emg_worker import (
-    ConvBnRelu,
     NinaProDatasetByRepetition,
     load_subject,
     run_task,
@@ -103,6 +102,8 @@ def build_config(args: argparse.Namespace) -> dict:
         num_stages     = args.num_stages,
         dropouts       = args.dropout,
         conv_blocks    = args.conv_blocks,
+        pool_sizes           = args.pool_sizes,
+        dataloader_workers   = args.dataloader_workers,
         train_reps     = args.train_reps,
         test_reps      = args.test_reps,
         window_step    = args.window_step,
@@ -161,16 +162,17 @@ def get_finished_runs(mlruns_dir: str, experiment: str) -> set[str]:
 
 def run_name_for(db, subject, window_size, kernels, num_stages,
                  model_type: str = "multiscale", dropout: float = 0.5,
-                 num_conv_blocks: int = 1) -> str:
+                 num_conv_blocks: int = 1, pool_size: int = 2) -> str:
     do = f"_do{dropout}"
+    ps = f"_p{pool_size}"
     if model_type == "conventional":
-        return f"db{db}_s{subject}_w{window_size}_conventional_b{num_conv_blocks}{do}"
+        return f"db{db}_s{subject}_w{window_size}_conventional_b{num_conv_blocks}{do}{ps}"
     return (f"db{db}_s{subject}_w{window_size}"
-            f"_k{'_'.join(map(str, kernels))}_stages{num_stages}{do}")
+            f"_k{'_'.join(map(str, kernels))}_stages{num_stages}{do}{ps}")
 
 
 def _build_pending(cfg: dict, model_type: str, finished: set) -> list:
-    """Return list of (subject, kernels, window_size, num_stages, model_type, dropout, num_conv_blocks)."""
+    """Return list of (subject, kernels, window_size, num_stages, model_type, dropout, num_conv_blocks, pool_size)."""
     pending = []
     db = cfg["db"]
 
@@ -178,26 +180,30 @@ def _build_pending(cfg: dict, model_type: str, finished: set) -> list:
         combos = list(itertools.product(cfg["conv_config"],
                                         cfg["window_sizes"],
                                         cfg["num_stages"],
-                                        cfg["dropouts"]))
+                                        cfg["dropouts"],
+                                        cfg["pool_sizes"]))
         for subject in cfg["subjects"]:
-            for kernels, window_size, num_stages, dropout in combos:
+            for kernels, window_size, num_stages, dropout, pool_size in combos:
                 if run_name_for(db, subject, window_size, kernels, num_stages,
-                                "multiscale", dropout, 1) not in finished:
+                                "multiscale", dropout, 1, pool_size) not in finished:
                     pending.append(
-                        (subject, kernels, window_size, num_stages, "multiscale", dropout, 1)
+                        (subject, kernels, window_size, num_stages, "multiscale",
+                         dropout, 1, pool_size)
                     )
 
     if model_type in ("conventional", "both"):
         combos = list(itertools.product(cfg["window_sizes"],
                                         cfg["dropouts"],
-                                        cfg["conv_blocks"]))
+                                        cfg["conv_blocks"],
+                                        cfg["pool_sizes"]))
         for subject in cfg["subjects"]:
-            for window_size, dropout, num_conv_blocks in combos:
+            for window_size, dropout, num_conv_blocks, pool_size in combos:
                 if run_name_for(db, subject, window_size, None, None,
-                                "conventional", dropout, num_conv_blocks) not in finished:
+                                "conventional", dropout, num_conv_blocks,
+                                pool_size) not in finished:
                     pending.append(
                         (subject, (3, 5, 11), window_size, 1, "conventional",
-                         dropout, num_conv_blocks)
+                         dropout, num_conv_blocks, pool_size)
                     )
 
     return pending
@@ -205,10 +211,11 @@ def _build_pending(cfg: dict, model_type: str, finished: set) -> list:
 
 def _total_runs(cfg: dict, model_type: str) -> int:
     n_do = len(cfg["dropouts"])
+    n_ps = len(cfg["pool_sizes"])
     n_ms = (len(cfg["subjects"]) * len(cfg["conv_config"])
-            * len(cfg["window_sizes"]) * len(cfg["num_stages"]) * n_do)
+            * len(cfg["window_sizes"]) * len(cfg["num_stages"]) * n_do * n_ps)
     n_cv = (len(cfg["subjects"]) * len(cfg["window_sizes"])
-            * n_do * len(cfg["conv_blocks"]))
+            * n_do * len(cfg["conv_blocks"]) * n_ps)
     if model_type == "multiscale":
         return n_ms
     if model_type == "conventional":
@@ -246,7 +253,7 @@ def cmd_train(cfg: dict, model_type: str, n_workers: int | None = None,
             cfg["train_reps"], cfg["test_reps"], cfg["window_step"],
             cfg["epochs"], cfg["lr"], cfg["weight_decay"], cfg["batch_size"],
             cfg["fs"], cfg["mlruns_dir"], cfg["experiment"], p[4], split_mode,
-            p[6], p[5],
+            p[6], p[5], p[7], cfg["dataloader_workers"],
         )
         for idx, p in enumerate(pending)
     ]
@@ -440,42 +447,50 @@ def _throughput_ms(model: nn.Module, loader: DataLoader, n_batches: int = 20) ->
     return float(np.mean(times))
 
 
+def _make_quantizer():
+    from torch.ao.quantization.quantizer.x86_inductor_quantizer import (
+        X86InductorQuantizer,
+        get_default_x86_inductor_quantization_config,
+    )
+    q = X86InductorQuantizer()
+    q.set_global(get_default_x86_inductor_quantization_config())
+    return q
+
+
 def quantize_ptq(fp32_model: nn.Module, calib_loader: DataLoader,
                  n_calib_batches: int) -> nn.Module:
-    from torch.ao.quantization import get_default_qconfig_mapping
-    from torch.ao.quantization.quantize_fx import convert_fx, prepare_fx
+    from torch.ao.quantization.quantize_pt2e import convert_pt2e, prepare_pt2e
 
-    example_input = next(iter(calib_loader))[0]
+    example_input = (next(iter(calib_loader))[0],)
     model = copy.deepcopy(fp32_model).cpu().eval()
-    qconfig_mapping = get_default_qconfig_mapping("x86")
-    model = prepare_fx(model, qconfig_mapping, example_input)
+    exported = torch.export.export(model, example_input)
+    prepared = prepare_pt2e(exported, _make_quantizer())
     with torch.no_grad():
         for i, (x, _) in enumerate(calib_loader):
-            model(x)
+            prepared(x)
             if i + 1 >= n_calib_batches:
                 break
-    return convert_fx(model)
+    return convert_pt2e(prepared)
 
 
 def quantize_qat(fp32_model: nn.Module, train_loader: DataLoader,
                  test_loader: DataLoader, epochs: int, lr: float) -> nn.Module:
-    from torch.ao.quantization import get_default_qat_qconfig_mapping
-    from torch.ao.quantization.quantize_fx import convert_fx, prepare_qat_fx
+    from torch.ao.quantization.quantize_pt2e import convert_pt2e, prepare_qat_pt2e
 
-    example_input = next(iter(train_loader))[0]
+    example_input = (next(iter(train_loader))[0],)
     model = copy.deepcopy(fp32_model).cpu()
-    qconfig_mapping = get_default_qat_qconfig_mapping("x86")
-    model = prepare_qat_fx(model, qconfig_mapping, example_input)
+    exported = torch.export.export(model, example_input)
+    prepared = prepare_qat_pt2e(exported, _make_quantizer())
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(prepared.parameters(), lr=lr)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
 
     for epoch in range(1, epochs + 1):
-        model.train()
+        prepared.train()
         correct = n = 0
         for x, y in train_loader:
-            logits = model(x)
+            logits = prepared(x)
             loss = criterion(logits, y)
             optimizer.zero_grad()
             loss.backward()
@@ -483,11 +498,11 @@ def quantize_qat(fp32_model: nn.Module, train_loader: DataLoader,
             correct += (logits.argmax(1) == y).sum().item()
             n += len(y)
         scheduler.step()
-        val_acc = _evaluate_cpu(model, test_loader)
+        val_acc = _evaluate_cpu(prepared, test_loader)
         print(f"  QAT epoch {epoch:3d}/{epochs}  train={correct/n:.3f}  val={val_acc:.3f}")
 
-    model.eval()
-    return convert_fx(model)
+    prepared.eval()
+    return convert_pt2e(prepared)
 
 
 def cmd_quantize(cfg: dict, subject: int, kernels: tuple, window_size: int,
@@ -501,9 +516,9 @@ def cmd_quantize(cfg: dict, subject: int, kernels: tuple, window_size: int,
 
     train_ds, test_ds, _ = _build_datasets(cfg, subject, window_size)
     train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"],
-                              shuffle=True,  num_workers=0)
+                              shuffle=True,  num_workers=4)
     test_loader  = DataLoader(test_ds,  batch_size=cfg["batch_size"],
-                              shuffle=False, num_workers=0)
+                              shuffle=False, num_workers=4)
 
     fp32_acc = _evaluate_cpu(fp32_model, test_loader)
     print(f"FP32 baseline accuracy : {fp32_acc:.4f}")
@@ -576,6 +591,10 @@ def make_parser() -> argparse.ArgumentParser:
                    help="Number of parallel workers (default: one per GPU). "
                         "Can exceed the number of GPUs — workers share GPUs "
                         "round-robin, useful on large GPUs like H100.")
+    p.add_argument("--dataloader-workers", dest="dataloader_workers", type=int, default=4,
+                   help="Number of DataLoader prefetch workers per training process "
+                        "(default: 4). Total CPU workers = n_workers × dataloader_workers. "
+                        "Set to 0 to disable (single-threaded, use for debugging).")
     p.add_argument("--ninapro-dir", dest="ninapro_dir", default=None,
                    help="Override ninapro_dir from config")
     p.add_argument("--mlruns-dir",  dest="mlruns_dir",  default=None,
@@ -583,16 +602,10 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--experiment",  default=None,
                    help="Override mlflow_experiment from config")
 
-    # Dataset / search space
+    # Dataset (shared across subcommands)
     p.add_argument("--db",          type=int, default=2)
     p.add_argument("--subjects",    type=int, nargs="+",
                    default=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
-    p.add_argument("--conv-config", dest="conv_config", type=_kernels, nargs="+",
-                   default=[(3,5,11), (5,9,19), (7,9,13), (3,11,23)])
-    p.add_argument("--window-sizes",dest="window_sizes", type=int, nargs="+",
-                   default=[400])
-    p.add_argument("--num-stages",  dest="num_stages",  type=int, nargs="+",
-                   default=[1])
 
     # Training hyperparameters
     p.add_argument("--train-reps",  dest="train_reps",  type=int, nargs="+",
@@ -616,6 +629,15 @@ def make_parser() -> argparse.ArgumentParser:
 
     # ── train ──────────────────────────────────────────────────────────────
     tp = sub.add_parser("train", help="Run / resume the grid search.")
+
+    # Search space (train-only)
+    tp.add_argument("--conv-config", dest="conv_config", type=_kernels, nargs="+",
+                    default=[(3,5,11), (7,9,13), (3,11,23)])
+    tp.add_argument("--window-sizes", dest="window_sizes", type=int, nargs="+",
+                    default=[400])
+    tp.add_argument("--num-stages",  dest="num_stages",  type=int, nargs="+",
+                    default=[1])
+
     tp.add_argument("--model", choices=["multiscale", "conventional", "both"],
                     default="both",
                     help="Which model(s) to train (default: both)")
@@ -633,6 +655,9 @@ def make_parser() -> argparse.ArgumentParser:
                     help="Dropout rate(s) to evaluate (default: 0.5). "
                          "Multiple values create separate runs, e.g. --dropout 0.1 0.3 0.5."
                          " Applied to both ConventionalCNN and MultiScaleEMGNet.")
+    tp.add_argument("--pool-sizes", dest="pool_sizes", type=int, nargs="+", default=[2],
+                    help="MaxPool kernel size(s) to sweep (default: 2). "
+                         "E.g. --pool-sizes 2 3 4. Applied to both networks.")
 
     # ── results ────────────────────────────────────────────────────────────
     rp = sub.add_parser("results", help="Print ranked results from MLflow.")

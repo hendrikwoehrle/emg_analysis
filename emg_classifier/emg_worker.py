@@ -293,7 +293,7 @@ class ConventionalCNN(nn.Module):
         return min(32 * (2 ** (block_idx // 2)), 256)
 
     def __init__(self, n_channels: int, num_classes: int, num_blocks: int = 1,
-                 dropout: float = 0.5):
+                 dropout: float = 0.5, pool_size: int = 2):
         super().__init__()
         assert 1 <= num_blocks <= 10, "num_blocks must be between 1 and 10"
 
@@ -309,7 +309,7 @@ class ConventionalCNN(nn.Module):
                 nn.ReLU(inplace=True),
             ]
             if (i + 1) % 2 == 0:          # pool after every 2nd block
-                layers.append(nn.MaxPool1d(kernel_size=2, stride=2))
+                layers.append(nn.MaxPool1d(kernel_size=pool_size, stride=pool_size))
             in_ch = out_ch
         self.branch = nn.Sequential(*layers)
         self.gap = nn.AdaptiveAvgPool1d(1)
@@ -347,6 +347,7 @@ class MultiScaleEMGNet(nn.Module):
         kernels: tuple = (3, 7, 15),
         num_stages: int = 1,
         dropout: float = 0.5,
+        pool_size: int = 2,
     ):
         super().__init__()
         base = 192
@@ -359,13 +360,13 @@ class MultiScaleEMGNet(nn.Module):
                 dropout=dropout if i == num_stages - 1 else 0.0,
             ))
             if i < num_stages - 1:
-                stages.append(nn.MaxPool1d(2))
+                stages.append(nn.MaxPool1d(pool_size))
             in_ch = base
         self.backbone = nn.Sequential(*stages)
 
         self.refine = nn.Sequential(
             ConvBnRelu(base, 256, 3),
-            nn.MaxPool1d(2),
+            nn.MaxPool1d(pool_size),
             ConvBnRelu(256, 256, 3),
             nn.Dropout(dropout),
         )
@@ -411,6 +412,8 @@ def train_and_evaluate(
     split_mode: str = "repetition",
     num_conv_blocks: int = 1,
     dropout: float = 0.5,
+    pool_size: int = 2,
+    dataloader_workers: int = 4,
 ) -> dict:
     """Train and evaluate one subject.
 
@@ -447,6 +450,7 @@ def train_and_evaluate(
             "split_mode": split_mode,
             "num_conv_blocks": num_conv_blocks,
             "dropout": dropout,
+            "pool_size": pool_size,
             "initialization": "kaiming_normal",
             "train_reps": str(train_reps),
             "test_reps": str(test_reps),
@@ -492,10 +496,13 @@ def train_and_evaluate(
                 channel_stats=train_ds.channel_stats,
             )
 
+        pw = dataloader_workers > 0
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                                  num_workers=0, pin_memory=True)
+                                  num_workers=dataloader_workers, pin_memory=True,
+                                  persistent_workers=pw, prefetch_factor=2 if pw else None)
         test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
-                                 num_workers=0, pin_memory=True)
+                                 num_workers=dataloader_workers, pin_memory=True,
+                                 persistent_workers=pw, prefetch_factor=2 if pw else None)
 
         mlflow.log_params({
             "num_classes": num_classes,
@@ -507,11 +514,12 @@ def train_and_evaluate(
         if model_type == "conventional":
             model = ConventionalCNN(n_channels, num_classes,
                                     num_blocks=num_conv_blocks,
-                                    dropout=dropout).to(device)
+                                    dropout=dropout,
+                                    pool_size=pool_size).to(device)
         else:
             model = MultiScaleEMGNet(
                 n_channels, num_classes, kernels=kernels, num_stages=num_stages,
-                dropout=dropout
+                dropout=dropout, pool_size=pool_size,
             ).to(device)
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         mlflow.log_param("n_params", n_params)
@@ -585,13 +593,13 @@ def run_task(args: tuple) -> dict:
         db, subject, kernels, window_size, num_stages, device_str,
         ninapro_dir, train_reps, test_reps, window_step, epochs, lr,
         weight_decay, batch_size, fs, mlruns_dir, experiment, model_type,
-        split_mode, num_conv_blocks, dropout
+        split_mode, num_conv_blocks, dropout, pool_size, dataloader_workers
     """
     (
         db, subject, kernels, window_size, num_stages, device_str,
         ninapro_dir, train_reps, test_reps, window_step, epochs, lr,
         weight_decay, batch_size, fs, mlruns_dir, experiment, model_type,
-        split_mode, num_conv_blocks, dropout,
+        split_mode, num_conv_blocks, dropout, pool_size, dataloader_workers,
     ) = args
 
     # Write full traceback to a per-worker log file so pool crashes are visible
@@ -629,6 +637,8 @@ def run_task(args: tuple) -> dict:
             split_mode=split_mode,
             num_conv_blocks=num_conv_blocks,
             dropout=dropout,
+            pool_size=pool_size,
+            dataloader_workers=dataloader_workers,
         )
         result.pop("model", None)   # not needed cross-process
         logging.info("run_task finished: acc=%.4f", result["final_acc"])
