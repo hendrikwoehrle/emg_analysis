@@ -40,6 +40,7 @@ import multiprocessing
 import os
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -104,6 +105,7 @@ def build_config(args: argparse.Namespace) -> dict:
         conv_blocks    = args.conv_blocks,
         pool_sizes           = args.pool_sizes,
         dataloader_workers   = args.dataloader_workers,
+        checkpoint_epochs    = getattr(args, "checkpoint_epochs", []),
         train_reps     = args.train_reps,
         test_reps      = args.test_reps,
         window_step    = args.window_step,
@@ -113,6 +115,80 @@ def build_config(args: argparse.Namespace) -> dict:
         batch_size     = args.batch_size,
         fs             = args.fs,
     )
+
+
+# ===========================================================================
+# Memory detection (cgroup-aware for SLURM / container environments)
+# ===========================================================================
+
+def _cgroup_memory_limit_bytes() -> int | None:
+    """Return the effective cgroup memory limit for this process, or None.
+
+    Walks up the cgroup hierarchy so it works under SLURM's nested cgroup
+    layout regardless of cgroup v1 vs v2.
+    """
+    try:
+        cg_lines = Path("/proc/self/cgroup").read_text().splitlines()
+    except OSError:
+        return None
+
+    for line in cg_lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        hier_id, controllers, rel = parts[0], parts[1], parts[2].lstrip("/")
+
+        if hier_id == "0":  # cgroup v2 unified hierarchy
+            p = Path("/sys/fs/cgroup") / rel
+            while p != Path("/sys/fs/cgroup"):
+                try:
+                    text = (p / "memory.max").read_text().strip()
+                    if text != "max":
+                        return int(text)
+                except (OSError, ValueError):
+                    pass
+                p = p.parent
+
+        elif "memory" in controllers.split(","):  # cgroup v1 memory controller
+            p = Path("/sys/fs/cgroup/memory") / rel
+            while p != Path("/sys/fs/cgroup/memory"):
+                try:
+                    val = int((p / "memory.limit_in_bytes").read_text().strip())
+                    if val < 2 ** 62:   # filter the "unlimited" sentinel (~2^63)
+                        return val
+                except (OSError, ValueError):
+                    pass
+                p = p.parent
+
+    return None
+
+
+def detect_memory() -> tuple[float, str]:
+    """Return (available_gb, source_label) respecting cgroup limits."""
+    limit = _cgroup_memory_limit_bytes()
+    if limit is not None:
+        # Subtract already-used memory so we know what is still free.
+        used = 0
+        for candidate in [
+            "/sys/fs/cgroup/memory.current",
+            "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+        ]:
+            try:
+                used = int(Path(candidate).read_text().strip())
+                break
+            except (OSError, ValueError):
+                pass
+        return (limit - used) / 1024 ** 3, "cgroup limit"
+
+    # Fallback: kernel's MemAvailable from /proc/meminfo
+    try:
+        for ln in Path("/proc/meminfo").read_text().splitlines():
+            if ln.startswith("MemAvailable:"):
+                return int(ln.split()[1]) / 1024 ** 2, "/proc/meminfo"
+    except OSError:
+        pass
+
+    return float("inf"), "unknown"
 
 
 # ===========================================================================
@@ -229,6 +305,48 @@ def cmd_train(cfg: dict, model_type: str, n_workers: int | None = None,
     n_workers = n_workers if n_workers else len(devices)
     print(f"Available devices : {devices}  ({len(devices)} GPUs, {n_workers} workers)")
 
+    # ── Memory check (cgroup-aware for SLURM) ─────────────────────────────
+    avail_gb, mem_src = detect_memory()
+    # Each worker imports torch/scipy/pywt/mlflow + loads subject data + model.
+    # Empirically ~1.5 GB RSS per worker (adjust MEM_PER_WORKER_GB if needed).
+    MEM_PER_WORKER_GB = 1.5
+    max_workers_by_mem = max(1, int(avail_gb / MEM_PER_WORKER_GB))
+    print(f"Available memory  : {avail_gb:.1f} GB  ({mem_src})")
+    print(f"Est. mem/worker   : {MEM_PER_WORKER_GB} GB  → safe max workers: {max_workers_by_mem}")
+    if n_workers > max_workers_by_mem:
+        print(
+            f"WARNING: Requested --n-workers {n_workers} would need "
+            f"~{n_workers * MEM_PER_WORKER_GB:.0f} GB; capping to {max_workers_by_mem} "
+            f"to stay within the {avail_gb:.1f} GB limit.\n"
+            f"  To use more workers, increase your SLURM --mem allocation "
+            f"(need at least {n_workers * MEM_PER_WORKER_GB:.0f} GB)."
+        )
+        n_workers = max_workers_by_mem
+
+    # ── DataLoader sub-process guard ──────────────────────────────────────
+    # DataLoader workers are fork()ed from training workers.  Python's
+    # per-object refcounts cause copy-on-write for almost every page, so
+    # each DataLoader worker effectively costs ~0.5 GB of real RAM even
+    # though the data is "shared".  Budget: remaining memory after training
+    # workers are accounted for, divided by (n_workers × cost_per_dl_worker).
+    MEM_PER_DL_WORKER_GB = 0.5   # conservative CoW estimate per fork
+    cpu_count = os.cpu_count() or 4
+    cpu_safe  = max(0, cpu_count // n_workers - 1)
+    if avail_gb < float("inf"):
+        mem_remaining = avail_gb - n_workers * MEM_PER_WORKER_GB
+        mem_safe = max(0, int(mem_remaining / (n_workers * MEM_PER_DL_WORKER_GB)))
+    else:
+        mem_safe = cpu_safe
+    safe_dl = min(cpu_safe, mem_safe)
+    if cfg["dataloader_workers"] > safe_dl:
+        print(
+            f"INFO: Capping dataloader_workers {cfg['dataloader_workers']} → {safe_dl} "
+            f"(avail={avail_gb:.0f} GB, {n_workers} workers; "
+            f"{n_workers}×{safe_dl} forks × ~{MEM_PER_DL_WORKER_GB} GB CoW fits, "
+            f"{n_workers}×{cfg['dataloader_workers']} would not)"
+        )
+        cfg["dataloader_workers"] = safe_dl
+
     mlflow.set_tracking_uri(cfg["mlruns_dir"])
     mlflow.set_experiment(cfg["experiment"])
 
@@ -253,7 +371,7 @@ def cmd_train(cfg: dict, model_type: str, n_workers: int | None = None,
             cfg["train_reps"], cfg["test_reps"], cfg["window_step"],
             cfg["epochs"], cfg["lr"], cfg["weight_decay"], cfg["batch_size"],
             cfg["fs"], cfg["mlruns_dir"], cfg["experiment"], p[4], split_mode,
-            p[6], p[5], p[7], cfg["dataloader_workers"],
+            p[6], p[5], p[7], cfg["dataloader_workers"], cfg["checkpoint_epochs"],
         )
         for idx, p in enumerate(pending)
     ]
@@ -268,22 +386,62 @@ def cmd_train(cfg: dict, model_type: str, n_workers: int | None = None,
             r = run_task(t)
             print(f"  → acc={r['final_acc']:.4f}")
     else:
-        # Multi-GPU: fork workers BEFORE any CUDA is initialised → safe.
-        # Limit BLAS/OpenMP threads to 1 before fork: pywt and numpy use
-        # multi-threaded libraries whose internal threads cannot survive a fork
-        # (the child inherits a deadlocked state and gets killed by the OS).
-        ctx = multiprocessing.get_context("spawn")
+        # ProcessPoolExecutor starts ALL max_workers processes simultaneously,
+        # so if n_workers=32, up to 32 fresh Python processes each import
+        # torch/scipy/pywt (~500 MB each) at the same time → OOM spike even
+        # before any data is loaded.  We throttle submissions with a semaphore
+        # so that at most n_workers tasks are IN-FLIGHT at once, but crucially
+        # we pre-create only a pool of n_workers workers that are reused across
+        # all 300+ tasks — they never all import simultaneously.
+        #
+        # forkserver is recommended for CUDA workers on Linux (single server
+        # forked before any CUDA init; workers fork from it cheaply).
+        ctx_name = "forkserver" if sys.platform != "win32" else "spawn"
+        ctx = multiprocessing.get_context(ctx_name)
+        # threading.Semaphore because done_callback runs in the pool's
+        # internal *thread*, not a subprocess.
+        sem = threading.Semaphore(n_workers)  # at most n_workers live tasks
+
+        def _submit_guarded(pool, task):
+            sem.acquire()
+            fut = pool.submit(run_task, task)
+            fut.add_done_callback(lambda _: sem.release())
+            return fut
+
+        completed = 0
         with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
-            futures = {pool.submit(run_task, t): t for t in tasks}
-            for i, fut in enumerate(as_completed(futures), 1):
+            # Pool-level smoke test: run one task through the pool first so
+            # that any worker-side crash (bad import, missing file, CUDA error)
+            # produces a real exception rather than BrokenProcessPool.
+            # Critically, this runs INSIDE a worker subprocess — no CUDA init
+            # in the main process, so the forkserver remains clean.
+            print(f"Smoke-testing first task through pool worker …")
+            try:
+                _r = pool.submit(run_task, tasks[0]).result(timeout=600)
+                print(f"  Worker OK  acc={_r['final_acc']:.4f}  "
+                      f"subject={_r['subject']}")
+                completed = 1
+                remaining_tasks = tasks[1:]
+            except Exception as _e:
+                print(f"  Worker FAILED: {_e}")
+                import traceback as _tb
+                _tb.print_exc()
+                sys.exit(1)
+
+            futures = {}
+            for t in remaining_tasks:
+                fut = _submit_guarded(pool, t)
+                futures[fut] = t
+            for fut in as_completed(futures):
+                completed += 1
                 t = futures[fut]
                 try:
                     r = fut.result()
-                    print(f"[{i}/{len(tasks)}] done  "
+                    print(f"[{completed}/{len(tasks)}] done  "
                           f"subject={r['subject']}  model={r['model_type']}  "
                           f"acc={r['final_acc']:.4f}")
                 except Exception as e:
-                    print(f"[{i}/{len(tasks)}] ERROR  task={t[:5]}  {e}")
+                    print(f"[{completed}/{len(tasks)}] ERROR  task={t[:5]}  {e}")
 
     print("All runs complete.")
 
@@ -405,6 +563,32 @@ def _evaluate_cpu(model: nn.Module, loader: DataLoader) -> float:
     )
 
 
+def _find_model_uri(mlruns_dir: str, exp_id: str, run_id: str,
+                    artifact_name: str = "model") -> str:
+    """Return the artifact_location for a logged model.
+
+    MLflow ≥ 2.18 stores models under {exp_id}/models/m-{uuid}/ instead of
+    {run_id}/artifacts/{name}/.  We scan the experiment's models directory for
+    a meta.yaml whose source_run_id and name match, then return that path.
+    Falls back to the legacy artifacts path for older MLflow versions.
+    """
+    import yaml
+
+    models_dir = Path(mlruns_dir) / exp_id / "models"
+    if models_dir.exists():
+        for model_dir in models_dir.iterdir():
+            meta_file = model_dir / "meta.yaml"
+            if not meta_file.exists():
+                continue
+            meta = yaml.safe_load(meta_file.read_text())
+            if (meta.get("source_run_id") == run_id
+                    and meta.get("name") == artifact_name):
+                return meta["artifact_location"]
+
+    # Legacy path (MLflow < 2.18)
+    return str(Path(mlruns_dir) / exp_id / run_id / "artifacts" / artifact_name)
+
+
 def _load_fp32_model(cfg: dict, subject: int, window_size: int,
                      kernels: tuple, num_stages: int,
                      model_type: str = "multiscale") -> nn.Module:
@@ -422,7 +606,7 @@ def _load_fp32_model(cfg: dict, subject: int, window_size: int,
     if not runs:
         raise RuntimeError(f"No finished run '{name}'. Train it first.")
     run_id = runs[0].info.run_id
-    uri = f"{cfg['mlruns_dir']}/{exp.experiment_id}/{run_id}/artifacts/model"
+    uri = _find_model_uri(cfg["mlruns_dir"], exp.experiment_id, run_id)
     return mlflow.pytorch.load_model(uri, map_location="cpu").eval()
 
 
@@ -565,7 +749,12 @@ def cmd_quantize(cfg: dict, subject: int, kernels: tuple, window_size: int,
             "size_ratio":    int8_kb / fp32_kb,
             "latency_ratio": int8_ms / fp32_ms,
         })
-        mlflow.pytorch.log_model(q_model, artifact_path="model_int8")
+        _x_example, _ = next(iter(test_loader))
+        mlflow.pytorch.log_model(
+            q_model,
+            name="model_int8",
+            input_example=_x_example.numpy(),
+        )
     print("\nQuantized model logged to MLflow.")
 
 
@@ -617,7 +806,7 @@ def make_parser() -> argparse.ArgumentParser:
                    help="Test repetitions  (DB2/DB5 default: 2 5; "
                         "DB1: 3 5 8; DB7: 3 6)")
     p.add_argument("--window-step", dest="window_step", type=int, default=32)
-    p.add_argument("--epochs",      type=int,   default=100)
+    p.add_argument("--epochs",      type=int,   default=10)
     p.add_argument("--lr",          type=float, default=1e-3)
     p.add_argument("--weight-decay",dest="weight_decay", type=float, default=1e-4)
     p.add_argument("--batch-size",  dest="batch_size",   type=int,   default=64)
@@ -658,6 +847,11 @@ def make_parser() -> argparse.ArgumentParser:
     tp.add_argument("--pool-sizes", dest="pool_sizes", type=int, nargs="+", default=[2],
                     help="MaxPool kernel size(s) to sweep (default: 2). "
                          "E.g. --pool-sizes 2 3 4. Applied to both networks.")
+    tp.add_argument("--checkpoint-epochs", dest="checkpoint_epochs", type=int,
+                    nargs="+", default=[5, 10, 15, 20],
+                    help="Save intermediate model snapshots at these epoch numbers. "
+                         "E.g. --checkpoint-epochs 10 20 saves artifacts "
+                         "'model_epoch10' and 'model_epoch20' in the same MLflow run.")
 
     # ── results ────────────────────────────────────────────────────────────
     rp = sub.add_parser("results", help="Print ranked results from MLflow.")

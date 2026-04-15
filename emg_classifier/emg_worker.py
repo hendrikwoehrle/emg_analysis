@@ -414,6 +414,7 @@ def train_and_evaluate(
     dropout: float = 0.5,
     pool_size: int = 2,
     dataloader_workers: int = 4,
+    checkpoint_epochs: list = (),
 ) -> dict:
     """Train and evaluate one subject.
 
@@ -496,13 +497,17 @@ def train_and_evaluate(
                 channel_stats=train_ds.channel_stats,
             )
 
-        pw = dataloader_workers > 0
+        # persistent_workers keeps sub-processes alive across all epochs.
+        # When many training workers run in parallel this creates a sustained
+        # peak of n_training_workers × dataloader_workers processes → OOM.
+        # Disable it so DataLoader workers are released after each epoch.
+        pw = False
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                                   num_workers=dataloader_workers, pin_memory=True,
-                                  persistent_workers=pw, prefetch_factor=2 if pw else None)
+                                  persistent_workers=pw, prefetch_factor=2 if dataloader_workers > 0 else None)
         test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False,
                                  num_workers=dataloader_workers, pin_memory=True,
-                                 persistent_workers=pw, prefetch_factor=2 if pw else None)
+                                 persistent_workers=pw, prefetch_factor=2 if dataloader_workers > 0 else None)
 
         mlflow.log_params({
             "num_classes": num_classes,
@@ -553,6 +558,15 @@ def train_and_evaluate(
                 mlflow.log_metric(f"{phase}_acc", acc, step=epoch)
             scheduler.step()
 
+            if epoch in checkpoint_epochs:
+                _x_ck, _ = next(iter(test_loader))
+                mlflow.pytorch.log_model(
+                    model.cpu(),
+                    name=f"model_epoch{epoch}",
+                    input_example=_x_ck.numpy(),
+                )
+                model.to(device)
+
         model.eval()
         all_preds, all_true = [], []
         with torch.no_grad():
@@ -564,7 +578,15 @@ def train_and_evaluate(
         final_acc = accuracy_score(all_true, all_preds)
 
         mlflow.log_metric("final_test_acc", final_acc)
-        mlflow.pytorch.log_model(model, artifact_path="model")
+        # Build a CPU input example so MLflow can infer the model signature.
+        # Use the first batch of the test loader (already on CPU via .cpu()).
+        _x_example, _ = next(iter(test_loader))
+        mlflow.pytorch.log_model(
+            model.cpu(),
+            name="model",
+            input_example=_x_example.numpy(),
+        )
+        model.to(device)   # move back to device for any code that follows
         print(f"  [{run_name}]  acc={final_acc:.4f}  params={n_params:,}")
 
     return {
@@ -593,13 +615,15 @@ def run_task(args: tuple) -> dict:
         db, subject, kernels, window_size, num_stages, device_str,
         ninapro_dir, train_reps, test_reps, window_step, epochs, lr,
         weight_decay, batch_size, fs, mlruns_dir, experiment, model_type,
-        split_mode, num_conv_blocks, dropout, pool_size, dataloader_workers
+        split_mode, num_conv_blocks, dropout, pool_size, dataloader_workers,
+        checkpoint_epochs
     """
     (
         db, subject, kernels, window_size, num_stages, device_str,
         ninapro_dir, train_reps, test_reps, window_step, epochs, lr,
         weight_decay, batch_size, fs, mlruns_dir, experiment, model_type,
         split_mode, num_conv_blocks, dropout, pool_size, dataloader_workers,
+        checkpoint_epochs,
     ) = args
 
     # Write full traceback to a per-worker log file so pool crashes are visible
@@ -639,8 +663,12 @@ def run_task(args: tuple) -> dict:
             dropout=dropout,
             pool_size=pool_size,
             dataloader_workers=dataloader_workers,
+            checkpoint_epochs=checkpoint_epochs,
         )
-        result.pop("model", None)   # not needed cross-process
+        # Strip large arrays not needed cross-process to keep the
+        # inter-process pickle payload small.
+        for key in ("model", "preds", "true", "history"):
+            result.pop(key, None)
         logging.info("run_task finished: acc=%.4f", result["final_acc"])
         return result
     except Exception:
